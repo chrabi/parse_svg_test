@@ -1,0 +1,121 @@
+import os
+import re
+from xml.etree import ElementTree as ET
+
+def extract_x_y_from_transform(transform_value):
+    match = re.search(r'matrix\(([^)]+)\)', transform_value)
+    if match:
+        values = match.group(1).split()
+        if len(values) == 6:
+            return float(values[4]), float(values[5])
+    return None, None
+
+def create_new_transform(original_transform, new_x):
+    match = re.search(r'matrix\(([^)]+)\)', original_transform)
+    if match:
+        values = match.group(1).split()
+        if len(values) == 6:
+            values[4] = str(new_x)
+            return f"matrix({' '.join(values)})"
+    return original_transform
+
+def find_parent(root, element):
+    for parent in root.iter():
+        for child in parent:
+            if child == element:
+                return parent
+    return None
+
+def calculate_average_step(elements):
+    if len(elements) < 2:
+        return 7.8  # Domyślna wartość, jeśli nie ma wystarczającej liczby elementów
+
+    x_values = [x for _, (x, _) in elements]
+    if len(x_values) < 2:
+        return 7.8  # Domyślna wartość, jeśli nie można obliczyć odstępu
+
+    differences = [x_values[i+1] - x_values[i] for i in range(len(x_values)-1)]
+    return sum(differences) / len(differences)
+
+def create_square_path(x, y, size):
+    return f"M {x} {y} h {size} v {size} h -{size} Z"
+
+def clean_and_update_svg(file_path):
+    ET.register_namespace("", "http://www.w3.org/2000/svg")
+    tree = ET.parse(file_path)
+    root = tree.getroot()
+
+    # Usuń sekcję <g clip-path="url(#clip6)">
+    for element in root.findall(".//*[@clip-path='url(#clip6)']"):
+        parent = find_parent(root, element)
+        if parent is not None:
+            parent.remove(element)
+
+    text_elements = root.findall(".//*{http://www.w3.org/2000/svg}text")
+
+    elements_dict = {}
+    for element in text_elements:
+        if element.text and element.text.isdigit() and len(element.text) == 3:
+            value = int(element.text)
+            x, y = extract_x_y_from_transform(element.get('transform'))
+            if x is not None and y is not None:
+                elements_dict[value] = (x, y, element)
+
+    if not elements_dict:
+        print(f"Nie znaleziono elementów numerycznych w pliku: {file_path}")
+        return
+
+    # Sortuj elementy według ich wartości numerycznej
+    sorted_elements = sorted(elements_dict.items())
+
+    # Wybierz element startowy (z najmniejszą wartością)
+    start_value, (start_x, start_y, start_element) = sorted_elements[0]
+
+    # Oblicz średni odstęp między elementami
+    average_step = calculate_average_step(sorted_elements[:4])  # Użyj pierwszych 4 elementów do obliczenia odstępu
+
+    # Usuń elementy, których pozycja x różni się znacząco od oczekiwanej
+    elements_to_remove = []
+    for value, (x, y, element) in sorted_elements:
+        expected_x = start_x + (value - start_value) * average_step
+        if abs(x - expected_x) > 10:  # Tolerancja 10 jednostek
+            elements_to_remove.append(element)
+
+    for element in elements_to_remove:
+        parent = find_parent(root, element)
+        if parent is not None:
+            parent.remove(element)
+
+    # Aktualizuj słownik elementów
+    for element in elements_to_remove:
+        for key, (_, _, el) in elements_dict.items():
+            if el == element:
+                del elements_dict[key]
+                break
+
+    # Utwórz grupę dla kwadratów
+    squares_group = ET.SubElement(root, 'g', {'id': 'squares'})
+
+    # Dodaj kwadraty dla istniejących lokalizacji
+    square_size = average_step * 0.8  # Rozmiar kwadratu nieco mniejszy niż odstęp
+    for value, (x, y, _) in sorted(elements_dict.items()):
+        square_path = create_square_path(x, y, square_size)
+        ET.SubElement(squares_group, 'path', {
+            'd': square_path,
+            'fill': 'rgba(0, 255, 0, 0.5)',  # Półprzezroczysty zielony
+            'stroke': 'none'
+        })
+
+    tree.write(file_path, encoding='utf-8', xml_declaration=True)
+
+def main():
+    svg_directory = '.'
+
+    for filename in os.listdir(svg_directory):
+        if filename.endswith('.svg'):
+            file_path = os.path.join(svg_directory, filename)
+            clean_and_update_svg(file_path)
+            print(f"Zaktualizowano i wyczyszczono plik: {filename}")
+
+if __name__ == "__main__":
+    main()
