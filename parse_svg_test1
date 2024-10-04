@@ -40,6 +40,11 @@ def calculate_average_step(elements):
 def create_square_path(x, y, size):
     return f"M {x} {y} h {size} v {size} h -{size} Z"
 
+def generate_location_id(x, y):
+    col = chr(65 + (x // 26)) + chr(65 + (x % 26))
+    row = f"{y:03d}"
+    return f"{col}{row}"
+
 def clean_and_update_svg(file_path):
     ET.register_namespace("", "http://www.w3.org/2000/svg")
     tree = ET.parse(file_path)
@@ -76,40 +81,41 @@ def clean_and_update_svg(file_path):
     # Oblicz średni odstęp między elementami
     average_step = calculate_average_step(sorted_elements[:4])  # Użyj pierwszych 4 elementów do obliczenia odstępu
 
-    # Usuń elementy, których pozycja x różni się znacząco od oczekiwanej
-    elements_to_remove = []
-    for value, (x, y, element) in sorted_elements:
-        expected_x = start_x + (value - start_value) * average_step
-        if abs(x - expected_x) > 10:  # Tolerancja 10 jednostek
-            elements_to_remove.append(element)
-
-    for element in elements_to_remove:
-        parent = find_parent(root, element)
-        if parent is not None:
-            parent.remove(element)
-
-    # Aktualizuj słownik elementów
-    for element in elements_to_remove:
-        for key, (_, _, el) in elements_dict.items():
-            if el == element:
-                del elements_dict[key]
-                break
+    # Uzupełnij brakujące wartości
+    for i in range(start_value, 132):  # Uzupełniamy do 131
+        if i not in elements_dict:
+            new_x = start_x + (i - start_value) * average_step
+            new_y = start_y
+            new_element = ET.Element('{http://www.w3.org/2000/svg}text')
+            new_element.text = f"{i:03d}"
+            new_transform = create_new_transform(start_element.get('transform'), new_x)
+            new_element.set('transform', new_transform)
+            elements_dict[i] = (new_x, new_y, new_element)
+            parent = find_parent(root, start_element)
+            if parent is not None:
+                parent.append(new_element)
 
     # Utwórz grupę dla kwadratów
     squares_group = ET.SubElement(root, 'g', {'id': 'squares'})
 
     # Dodaj kwadraty dla istniejących lokalizacji
     square_size = average_step * 0.8  # Rozmiar kwadratu nieco mniejszy niż odstęp
-    for value, (x, y, _) in sorted(elements_dict.items()):
-        try:
-            square_path = create_square_path(x, y, square_size)
-            ET.SubElement(squares_group, 'path', {
-                'd': square_path,
-                'fill': 'rgba(0, 255, 0, 0.5)',  # Półprzezroczysty zielony
-                'stroke': 'none'
-            })
-        except Exception as e:
-            print(f"Błąd przy tworzeniu kwadratu dla wartości {value}: {e}")
+    for y in range(1, 132):
+        for x in range(21):  # 03A to 03U to 21 kolumn
+            location_id = generate_location_id(x, y)
+            square_x = start_x + x * average_step
+            square_y = start_y + (y - 1) * average_step
+            try:
+                square_path = create_square_path(square_x, square_y, square_size)
+                ET.SubElement(squares_group, 'path', {
+                    'd': square_path,
+                    'id': location_id,
+                    'fill': 'rgba(0, 255, 0, 0.5)',  # Półprzezroczysty zielony
+                    'stroke': 'black',
+                    'stroke-width': '0.5'
+                })
+            except Exception as e:
+                print(f"Błąd przy tworzeniu kwadratu dla lokalizacji {location_id}: {e}")
 
     tree.write(file_path, encoding='utf-8', xml_declaration=True)
 
