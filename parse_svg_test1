@@ -30,7 +30,7 @@ def calculate_average_step(elements):
     if len(elements) < 2:
         return 7.8  # Domyślna wartość, jeśli nie ma wystarczającej liczby elementów
 
-    x_values = [x for _, (x, _) in elements]
+    x_values = [x for _, (x, _, _) in elements]
     if len(x_values) < 2:
         return 7.8  # Domyślna wartość, jeśli nie można obliczyć odstępu
 
@@ -57,9 +57,11 @@ def clean_and_update_svg(file_path):
     for element in text_elements:
         if element.text and element.text.isdigit() and len(element.text) == 3:
             value = int(element.text)
-            x, y = extract_x_y_from_transform(element.get('transform'))
-            if x is not None and y is not None:
-                elements_dict[value] = (x, y, element)
+            transform = element.get('transform')
+            if transform:
+                x, y = extract_x_y_from_transform(transform)
+                if x is not None and y is not None:
+                    elements_dict[value] = (x, y, element)
 
     if not elements_dict:
         print(f"Nie znaleziono elementów numerycznych w pliku: {file_path}")
@@ -99,12 +101,15 @@ def clean_and_update_svg(file_path):
     # Dodaj kwadraty dla istniejących lokalizacji
     square_size = average_step * 0.8  # Rozmiar kwadratu nieco mniejszy niż odstęp
     for value, (x, y, _) in sorted(elements_dict.items()):
-        square_path = create_square_path(x, y, square_size)
-        ET.SubElement(squares_group, 'path', {
-            'd': square_path,
-            'fill': 'rgba(0, 255, 0, 0.5)',  # Półprzezroczysty zielony
-            'stroke': 'none'
-        })
+        try:
+            square_path = create_square_path(x, y, square_size)
+            ET.SubElement(squares_group, 'path', {
+                'd': square_path,
+                'fill': 'rgba(0, 255, 0, 0.5)',  # Półprzezroczysty zielony
+                'stroke': 'none'
+            })
+        except Exception as e:
+            print(f"Błąd przy tworzeniu kwadratu dla wartości {value}: {e}")
 
     tree.write(file_path, encoding='utf-8', xml_declaration=True)
 
