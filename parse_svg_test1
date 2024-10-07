@@ -14,30 +14,12 @@ def parse_path_d(d_value):
     coordinates = re.findall(r'[-+]?\d*\.\d+|\d+', d_value)
     return [float(coord) for coord in coordinates]
 
-def generate_location_id(x, y):
-    columns = ['03U', '03T', '03S', '03R', '03Q', '03P', '03O', '03N', '03M', '03L', '03K', '03J', '03I', '03H', '03G', '03F', '03E', '03D', '03C', '03B', '03A', '02X', '02W', '02V', '02U', '02T', '02S', '02R', '02Q', '02P', '02O', '02N', '02M', '02L', '02K', '02J', '02I', '02H', '02G', '02F', '02E', '02D', '02C', '02B', '02A']
-    col = columns[min(int(y), len(columns)-1)]
-    row = f"{int(x):03d}"
-    return f"{col}.{row}"
-
-def find_similar_paths(paths, tolerance=1.0):
-    groups = []
-    for path in paths:
-        d = path.get('d')
-        if d:
-            coords = parse_path_d(d)
-            if len(coords) == 4:  # Prostokąt
-                width = abs(coords[2] - coords[0])
-                height = abs(coords[3] - coords[1])
-                added = False
-                for group in groups:
-                    if abs(group['width'] - width) < tolerance and abs(group['height'] - height) < tolerance:
-                        group['paths'].append(path)
-                        added = True
-                        break
-                if not added:
-                    groups.append({'width': width, 'height': height, 'paths': [path]})
-    return groups
+def find_nearest_text(x, y, text_elements):
+    nearest_x = min((el for el in text_elements if el.text.isdigit()), 
+                    key=lambda el: abs(extract_x_y_from_transform(el.get('transform'))[0] - x))
+    nearest_y = min((el for el in text_elements if not el.text.isdigit()), 
+                    key=lambda el: abs(extract_x_y_from_transform(el.get('transform'))[1] - y))
+    return nearest_x.text, nearest_y.text
 
 def update_svg(file_path):
     ET.register_namespace("", "http://www.w3.org/2000/svg")
@@ -45,31 +27,34 @@ def update_svg(file_path):
     root = tree.getroot()
 
     path_elements = root.findall(".//*{http://www.w3.org/2000/svg}path")
-    black_paths = [p for p in path_elements if p.get('stroke') == '#000000']
+    text_elements = root.findall(".//*{http://www.w3.org/2000/svg}text")
 
-    similar_groups = find_similar_paths(black_paths)
-    largest_group = max(similar_groups, key=lambda g: len(g['paths']))
+    for path in path_elements:
+        if path.get('stroke') == '#000000':
+            d = path.get('d')
+            coords = parse_path_d(d)
+            if len(coords) == 4:
+                width = abs(coords[2] - coords[0])
+                height = abs(coords[3] - coords[1])
+                if width > 8 and height > 10:
+                    x, y = coords[0], coords[1]
+                    x_loc, y_loc = find_nearest_text(x, y, text_elements)
+                    location_id = f"{y_loc}.{x_loc}"
+                    
+                    path.set('id', location_id)
+                    path.set('fill', 'rgba(0, 255, 0, 0.3)')  # Półprzezroczysty zielony
+                    path.set('stroke', '#FF0000')  # Czerwona ramka
+                    path.set('stroke-width', '1')
 
-    for path in largest_group['paths']:
-        d = path.get('d')
-        coords = parse_path_d(d)
-        x, y = coords[0], coords[1]
-        location_id = generate_location_id(x, y)
-        
-        path.set('id', location_id)
-        path.set('fill', 'rgba(0, 255, 0, 0.3)')  # Półprzezroczysty zielony
-        path.set('stroke', '#FF0000')  # Czerwona ramka
-        path.set('stroke-width', '1')
-
-        # Dodaj tekst z lokalizacją
-        text_element = ET.SubElement(root, 'text')
-        text_element.set('x', str(x + largest_group['width']/2))
-        text_element.set('y', str(y + largest_group['height']/2))
-        text_element.set('text-anchor', 'middle')
-        text_element.set('dominant-baseline', 'middle')
-        text_element.set('font-size', '8')
-        text_element.set('fill', '#000000')
-        text_element.text = location_id
+                    # Dodaj tekst z lokalizacją
+                    text_element = ET.SubElement(root, 'text')
+                    text_element.set('x', str(x + width/2))
+                    text_element.set('y', str(y + height/2))
+                    text_element.set('text-anchor', 'middle')
+                    text_element.set('dominant-baseline', 'middle')
+                    text_element.set('font-size', '4')
+                    text_element.set('fill', '#000000')
+                    text_element.text = location_id
 
     tree.write(file_path, encoding='utf-8', xml_declaration=True)
 
