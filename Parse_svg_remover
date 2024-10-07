@@ -2,150 +2,102 @@ import os
 import re
 from xml.etree import ElementTree as ET
 
-# ... (pozostałe funkcje pozostają bez zmian)
+def extract_x_y_from_transform(transform_value):
+    match = re.search(r'matrix\(([^)]+)\)', transform_value)
+    if match:
+        values = match.group(1).split()
+        if len(values) == 6:
+            return float(values[4]), float(values[5])
+    return None, None
 
-def is_element_in_bounds(element, bounds):
-    transform = element.get('transform')
-    if transform:
-        x, y = extract_x_y_from_transform(transform)
-        if x is not None and y is not None:
-            return bounds['min_x'] <= x <= bounds['max_x'] and bounds['min_y'] <= y <= bounds['max_y']
-    return False
+def find_parent(root, element):
+    for parent in root.iter():
+        for child in parent:
+            if child == element:
+                return parent
+    return None
+
+def parse_path_d(d_value):
+    coordinates = re.findall(r'[-+]?\d*\.\d+|\d+', d_value)
+    return [float(coord) for coord in coordinates]
+
+def generate_location_id(col, row):
+    return f"{col}.{row:03d}"
 
 def clean_and_update_svg(file_path):
     ET.register_namespace("", "http://www.w3.org/2000/svg")
     tree = ET.parse(file_path)
     root = tree.getroot()
 
-    # Usuń sekcję <g clip-path="url(#clip6)">
-    for element in root.findall(".//*[@clip-path='url(#clip6)']"):
-        parent = find_parent(root, element)
-        if parent is not None:
-            parent.remove(element)
-
-    # Usuń elementy <path> z określonymi kolorami obramowania
-    paths_to_remove = root.findall(".//*{http://www.w3.org/2000/svg}path[@stroke='#FF0000']") + \
-                      root.findall(".//*{http://www.w3.org/2000/svg}path[@stroke='#00FF00']")
-    for path in paths_to_remove:
-        parent = find_parent(root, path)
-        if parent is not None:
-            parent.remove(path)
-
     text_elements = root.findall(".//*{http://www.w3.org/2000/svg}text")
+    path_elements = root.findall(".//*{http://www.w3.org/2000/svg}path")
 
-    elements_dict = {}
-    vertical_elements = {}
-    bounds = {'min_x': float('inf'), 'max_x': float('-inf'), 'min_y': float('inf'), 'max_y': float('-inf')}
-
+    corner_elements = {'001': None, '131': None, '03U': None, '02A': None}
     for element in text_elements:
-        if is_valid_text(element.text):
-            transform = element.get('transform')
-            if transform:
-                x, y = extract_x_y_from_transform(transform)
-                if x is not None and y is not None:
-                    if element.text.isdigit():
-                        value = int(element.text)
-                        if 1 <= value <= 131:
-                            elements_dict[value] = (x, y, element)
-                            bounds['min_y'] = min(bounds['min_y'], y)
-                            bounds['max_y'] = max(bounds['max_y'], y)
-                    elif element.text.startswith('03') or element.text == '02U':
-                        vertical_elements[element.text] = element
-                        bounds['min_x'] = min(bounds['min_x'], x)
-                        bounds['max_x'] = max(bounds['max_x'], x)
+        if element.text in corner_elements:
+            corner_elements[element.text] = element
 
-    # Dodaj 10% marginesu do granic
-    margin_x = (bounds['max_x'] - bounds['min_x']) * 0.1
-    margin_y = (bounds['max_y'] - bounds['min_y']) * 0.1
-    bounds['min_x'] -= margin_x
-    bounds['max_x'] += margin_x
-    bounds['min_y'] -= margin_y
-    bounds['max_y'] += margin_y
-
-    # Usuń elementy poza granicami
-    elements_to_remove = []
-    for element in root.iter():
-        if element.tag.endswith('}text') or element.tag.endswith('}path'):
-            if not is_element_in_bounds(element, bounds):
-                elements_to_remove.append(element)
-
-    for element in elements_to_remove:
-        parent = find_parent(root, element)
-        if parent is not None:
-            parent.remove(element)
-
-    if not elements_dict:
-        print(f"Nie znaleziono elementów numerycznych w pliku: {file_path}")
+    if not all(corner_elements.values()):
+        print("Nie znaleziono wszystkich elementów narożnych.")
         return
 
-    # Sortuj elementy według ich wartości numerycznej
-    sorted_elements = sorted(elements_dict.items())
+    # Ekstrahuj współrzędne narożników
+    corners = {}
+    for key, element in corner_elements.items():
+        x, y = extract_x_y_from_transform(element.get('transform'))
+        corners[key] = (x, y)
 
-    # Wybierz element startowy (z najmniejszą wartością)
-    start_value, (start_x, start_y, start_element) = sorted_elements[0]
+    # Znajdź linie poziome i pionowe
+    horizontal_lines = []
+    vertical_lines = []
+    for path in path_elements:
+        if path.get('stroke') == '#B9B9B9':
+            d = path.get('d')
+            coords = parse_path_d(d)
+            if len(coords) == 4:
+                if coords[0] == coords[2]:  # Linia pionowa
+                    vertical_lines.append(coords[0])
+                elif coords[1] == coords[3]:  # Linia pozioma
+                    horizontal_lines.append(coords[1])
 
-    # Oblicz średni odstęp między elementami
-    average_step = calculate_average_step(sorted_elements[:4])  # Użyj pierwszych 4 elementów do obliczenia odstępu
+    vertical_lines.sort()
+    horizontal_lines.sort()
 
-    # Kopiuj parametry transform z elementu referencyjnego
-    reference_transform = start_element.get('transform')
+    # Oblicz odstępy
+    vertical_step = (corners['03U'][0] - corners['02A'][0]) / 20  # 20 kolumn od 03U do 02A
+    horizontal_step = (corners['131'][1] - corners['001'][1]) / 130  # 130 wierszy od 001 do 131
 
-    # Uzupełnij brakujące wartości
-    for i in range(start_value, 132):  # Uzupełniamy do 131
-        if i not in elements_dict:
-            new_x = start_x + (i - start_value) * average_step
-            new_y = start_y
-            new_element = ET.Element('{http://www.w3.org/2000/svg}text')
-            new_element.text = f"{i:03d}"
-            new_transform = create_new_transform(reference_transform, new_x, new_y)
-            new_element.set('transform', new_transform)
-            for attr, value in start_element.attrib.items():
-                if attr != 'transform':
-                    new_element.set(attr, value)
-            elements_dict[i] = (new_x, new_y, new_element)
-            parent = find_parent(root, start_element)
-            if parent is not None:
-                parent.append(new_element)
+    # Utwórz grupę dla nowej siatki
+    grid_group = ET.SubElement(root, 'g', {'id': 'location_grid'})
 
-    # Utwórz grupę dla kwadratów
-    squares_group = ET.SubElement(root, 'g', {'id': 'squares'})
-
-    # Znajdź element 03U i 001
-    start_col = '03U'
-    start_element_03U = vertical_elements.get(start_col)
-    if start_element_03U is None:
-        print(f"Nie znaleziono elementu {start_col} w pliku: {file_path}")
-        return
-
-    start_x_03U, _ = extract_x_y_from_transform(start_element_03U.get('transform'))
-    if start_x_03U is None:
-        print(f"Nie można wyekstrahować pozycji x dla elementu {start_col}")
-        return
-
-    # Dodaj kwadraty dla istniejących lokalizacji
-    square_size = average_step * 0.8  # Rozmiar kwadratu nieco mniejszy niż odstęp
-    columns = ['03U', '03T', '03S', '03R', '03Q', '03P', '03O', '03N', '03M', '03L', '03K', '03J', '03I', '03H', '03G', '03F', '03E', '03D', '03C', '03B', '03A', '02U']
+    # Generuj siatkę
+    columns = ['03U', '03T', '03S', '03R', '03Q', '03P', '03O', '03N', '03M', '03L', '03K', '03J', '03I', '03H', '03G', '03F', '03E', '03D', '03C', '03B', '03A', '02A']
     for col_index, col in enumerate(columns):
         for row in range(1, 132):
+            x = corners['03U'][0] - col_index * vertical_step
+            y = corners['001'][1] + (row - 1) * horizontal_step
             location_id = generate_location_id(col, row)
-            square_x = start_x_03U - col_index * average_step
-            square_y = start_y + (row - 1) * average_step
-            if bounds['min_x'] <= square_x <= bounds['max_x'] and bounds['min_y'] <= square_y <= bounds['max_y']:
-                try:
-                    square_path = create_square_path(square_x, square_y, square_size)
-                    ET.SubElement(squares_group, 'path', {
-                        'd': square_path,
-                        'id': location_id,
-                        'fill': 'rgba(0, 255, 0, 0.5)',  # Półprzezroczysty zielony
-                        'stroke': 'black',
-                        'stroke-width': '0.5'
-                    })
-                except Exception as e:
-                    print(f"Błąd przy tworzeniu kwadratu dla lokalizacji {location_id}: {e}")
+
+            # Tworzenie prostokąta (zamiast kwadratu)
+            rect_path = f"M {x} {y} h {vertical_step} v {horizontal_step} h -{vertical_step} Z"
+            ET.SubElement(grid_group, 'path', {
+                'd': rect_path,
+                'id': location_id,
+                'fill': 'none',
+                'stroke': '#FF0000',  # Zmieniono kolor na czerwony
+                'stroke-width': '0.5'
+            })
 
     tree.write(file_path, encoding='utf-8', xml_declaration=True)
 
-# ... (funkcja main() pozostaje bez zmian)
+def main():
+    svg_directory = '.'
+
+    for filename in os.listdir(svg_directory):
+        if filename.endswith('.svg'):
+            file_path = os.path.join(svg_directory, filename)
+            clean_and_update_svg(file_path)
+            print(f"Zaktualizowano i wyczyszczono plik: {filename}")
 
 if __name__ == "__main__":
     main()
