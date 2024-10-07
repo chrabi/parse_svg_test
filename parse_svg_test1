@@ -10,112 +10,66 @@ def extract_x_y_from_transform(transform_value):
             return float(values[4]), float(values[5])
     return None, None
 
-def create_new_transform(original_transform, new_x):
-    match = re.search(r'matrix\(([^)]+)\)', original_transform)
-    if match:
-        values = match.group(1).split()
-        if len(values) == 6:
-            values[4] = str(new_x)
-            return f"matrix({' '.join(values)})"
-    return original_transform
-
-def find_parent(root, element):
-    for parent in root.iter():
-        for child in parent:
-            if child == element:
-                return parent
-    return None
-
-def calculate_average_step(elements):
-    if len(elements) < 2:
-        return 7.8  # Domyślna wartość, jeśli nie ma wystarczającej liczby elementów
-
-    x_values = [x for _, (x, _, _) in elements]
-    if len(x_values) < 2:
-        return 7.8  # Domyślna wartość, jeśli nie można obliczyć odstępu
-
-    differences = [x_values[i+1] - x_values[i] for i in range(len(x_values)-1)]
-    return sum(differences) / len(differences)
-
-def create_square_path(x, y, size):
-    return f"M {x} {y} h {size} v {size} h -{size} Z"
+def parse_path_d(d_value):
+    coordinates = re.findall(r'[-+]?\d*\.\d+|\d+', d_value)
+    return [float(coord) for coord in coordinates]
 
 def generate_location_id(x, y):
-    col = chr(65 + (x // 26)) + chr(65 + (x % 26))
-    row = f"{y:03d}"
-    return f"{col}{row}"
+    columns = ['03U', '03T', '03S', '03R', '03Q', '03P', '03O', '03N', '03M', '03L', '03K', '03J', '03I', '03H', '03G', '03F', '03E', '03D', '03C', '03B', '03A', '02X', '02W', '02V', '02U', '02T', '02S', '02R', '02Q', '02P', '02O', '02N', '02M', '02L', '02K', '02J', '02I', '02H', '02G', '02F', '02E', '02D', '02C', '02B', '02A']
+    col = columns[min(int(y), len(columns)-1)]
+    row = f"{int(x):03d}"
+    return f"{col}.{row}"
 
-def clean_and_update_svg(file_path):
+def find_similar_paths(paths, tolerance=1.0):
+    groups = []
+    for path in paths:
+        d = path.get('d')
+        if d:
+            coords = parse_path_d(d)
+            if len(coords) == 4:  # Prostokąt
+                width = abs(coords[2] - coords[0])
+                height = abs(coords[3] - coords[1])
+                added = False
+                for group in groups:
+                    if abs(group['width'] - width) < tolerance and abs(group['height'] - height) < tolerance:
+                        group['paths'].append(path)
+                        added = True
+                        break
+                if not added:
+                    groups.append({'width': width, 'height': height, 'paths': [path]})
+    return groups
+
+def update_svg(file_path):
     ET.register_namespace("", "http://www.w3.org/2000/svg")
     tree = ET.parse(file_path)
     root = tree.getroot()
 
-    # Usuń sekcję <g clip-path="url(#clip6)">
-    for element in root.findall(".//*[@clip-path='url(#clip6)']"):
-        parent = find_parent(root, element)
-        if parent is not None:
-            parent.remove(element)
+    path_elements = root.findall(".//*{http://www.w3.org/2000/svg}path")
+    black_paths = [p for p in path_elements if p.get('stroke') == '#000000']
 
-    text_elements = root.findall(".//*{http://www.w3.org/2000/svg}text")
+    similar_groups = find_similar_paths(black_paths)
+    largest_group = max(similar_groups, key=lambda g: len(g['paths']))
 
-    elements_dict = {}
-    for element in text_elements:
-        if element.text and element.text.isdigit() and len(element.text) == 3:
-            value = int(element.text)
-            transform = element.get('transform')
-            if transform:
-                x, y = extract_x_y_from_transform(transform)
-                if x is not None and y is not None:
-                    elements_dict[value] = (x, y, element)
+    for path in largest_group['paths']:
+        d = path.get('d')
+        coords = parse_path_d(d)
+        x, y = coords[0], coords[1]
+        location_id = generate_location_id(x, y)
+        
+        path.set('id', location_id)
+        path.set('fill', 'rgba(0, 255, 0, 0.3)')  # Półprzezroczysty zielony
+        path.set('stroke', '#FF0000')  # Czerwona ramka
+        path.set('stroke-width', '1')
 
-    if not elements_dict:
-        print(f"Nie znaleziono elementów numerycznych w pliku: {file_path}")
-        return
-
-    # Sortuj elementy według ich wartości numerycznej
-    sorted_elements = sorted(elements_dict.items())
-
-    # Wybierz element startowy (z najmniejszą wartością)
-    start_value, (start_x, start_y, start_element) = sorted_elements[0]
-
-    # Oblicz średni odstęp między elementami
-    average_step = calculate_average_step(sorted_elements[:4])  # Użyj pierwszych 4 elementów do obliczenia odstępu
-
-    # Uzupełnij brakujące wartości
-    for i in range(start_value, 132):  # Uzupełniamy do 131
-        if i not in elements_dict:
-            new_x = start_x + (i - start_value) * average_step
-            new_y = start_y
-            new_element = ET.Element('{http://www.w3.org/2000/svg}text')
-            new_element.text = f"{i:03d}"
-            new_transform = create_new_transform(start_element.get('transform'), new_x)
-            new_element.set('transform', new_transform)
-            elements_dict[i] = (new_x, new_y, new_element)
-            parent = find_parent(root, start_element)
-            if parent is not None:
-                parent.append(new_element)
-
-    # Utwórz grupę dla kwadratów
-    squares_group = ET.SubElement(root, 'g', {'id': 'squares'})
-
-    # Dodaj kwadraty dla istniejących lokalizacji
-    square_size = average_step * 0.8  # Rozmiar kwadratu nieco mniejszy niż odstęp
-    for y in range(1, 132):
-        for x in range(21):  # 03A to 03U to 21 kolumn
-            location_id = generate_location_id(x, y)
-            square_x = start_x + x * average_step
-            square_y = start_y + (y - 1) * average_step
-            try:
-                square_path = create_square_path(square_x, square_y, square_size)
-                ET.SubElement(squares_group, 'path', {
-                    'd': square_path,
-                    'id': location_id,
-                    'fill': 'rgba(0, 255, 0, 0.5)',  # Półprzezroczysty zielony
-                    'stroke': 'black',
-                    'stroke-width': '0.5'
-                })
-            except Exception as e:
-                print(f"Błąd przy tworzeniu kwadratu dla lokalizacji {location_id}: {e}")
+        # Dodaj tekst z lokalizacją
+        text_element = ET.SubElement(root, 'text')
+        text_element.set('x', str(x + largest_group['width']/2))
+        text_element.set('y', str(y + largest_group['height']/2))
+        text_element.set('text-anchor', 'middle')
+        text_element.set('dominant-baseline', 'middle')
+        text_element.set('font-size', '8')
+        text_element.set('fill', '#000000')
+        text_element.text = location_id
 
     tree.write(file_path, encoding='utf-8', xml_declaration=True)
 
@@ -125,8 +79,8 @@ def main():
     for filename in os.listdir(svg_directory):
         if filename.endswith('.svg'):
             file_path = os.path.join(svg_directory, filename)
-            clean_and_update_svg(file_path)
-            print(f"Zaktualizowano i wyczyszczono plik: {filename}")
+            update_svg(file_path)
+            print(f"Zaktualizowano plik: {filename}")
 
 if __name__ == "__main__":
     main()
