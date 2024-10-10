@@ -1,0 +1,70 @@
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+import math
+import re
+
+@dataclass
+class Rectangle:
+    x: float
+    y: float
+    width: float
+    height: float
+    
+    def diagonal(self):
+        return math.sqrt(self.width**2 + self.height**2)
+
+def parse_path(d):
+    numbers = re.findall(r'-?\d+\.?\d*', d)
+    return [float(num) for num in numbers]
+
+def process_svg(svg_content):
+    root = ET.fromstring(svg_content)
+    
+    # Znajdź wszystkie elementy <path>
+    paths = root.findall(".//{http://www.w3.org/2000/svg}path")
+    
+    rectangles = []
+    for path in paths:
+        d = path.get('d')
+        if d:
+            coords = parse_path(d)
+            if len(coords) == 4:  # Upewnij się, że to prostokąt (M x y h width v height)
+                rect = Rectangle(coords[0], coords[1], abs(coords[2]), abs(coords[3]))
+                rectangles.append((rect, path))
+    
+    # Znajdź prostokąty o boku 9.12
+    target_rectangles = []
+    for rect, path in rectangles:
+        if abs(rect.width - 9.12) < 0.01 or abs(rect.height - 9.12) < 0.01:
+            target_rectangles.append((rect, path))
+    
+    # Modyfikuj znalezione prostokąty
+    for rect, path in target_rectangles:
+        # Dodaj zielone półprzezroczyste wypełnienie
+        path.set('fill', 'rgba(0, 255, 0, 0.5)')
+        
+        # Znajdź współrzędne siatki
+        x_coord = int((rect.x - 7.8) / 7.8)  # Zakładamy, że pierwsza kolumna to 001
+        y_coord = int((rect.y - 7.8) / 7.8)  # Zakładamy, że pierwszy wiersz to 02A
+        
+        x_label = f"{x_coord+1:03d}"
+        y_label = f"02{chr(65 + y_coord)}"
+        
+        # Ustaw ID
+        path.set('id', f"{y_label}.{x_label}")
+        
+        # Dodaj tekst do środka prostokąta
+        text = ET.SubElement(root, '{http://www.w3.org/2000/svg}text')
+        text.set('x', str(rect.x + rect.width / 2))
+        text.set('y', str(rect.y + rect.height / 2))
+        text.set('text-anchor', 'middle')
+        text.set('dominant-baseline', 'central')
+        text.set('font-size', '4')
+        text.text = f"{y_label}.{x_label}"
+    
+    return ET.tostring(root, encoding='unicode')
+
+# Użycie:
+# svg_content = '''Tutaj wstaw zawartość pliku SVG'''
+# processed_svg = process_svg(svg_content)
+# print(processed_svg)
