@@ -13,54 +13,88 @@ class Rectangle:
     def diagonal(self):
         return math.sqrt(self.width**2 + self.height**2)
 
+@dataclass
+class GridLabel:
+    text: str
+    x: float
+    y: float
+
+def parse_transform(transform):
+    match = re.search(r'translate\(([\d.-]+),([\d.-]+)\)', transform)
+    if match:
+        return float(match.group(1)), float(match.group(2))
+    return None
+
 def parse_path(d):
     numbers = re.findall(r'-?\d+\.?\d*', d)
     return [float(num) for num in numbers]
 
 def process_svg(svg_content):
     root = ET.fromstring(svg_content)
+    ns = {'svg': 'http://www.w3.org/2000/svg'}
+    
+    # Znajdź wszystkie elementy <text>
+    texts = root.findall(".//svg:text", ns)
+    
+    # Podziel etykiety na pionowe i poziome
+    vertical_labels = []
+    horizontal_labels = []
+    
+    for text in texts:
+        content = text.text
+        if content:
+            x, y = 0, 0
+            transform = text.get('transform')
+            if transform:
+                translate = parse_transform(transform)
+                if translate:
+                    x, y = translate
+            else:
+                x = float(text.get('x', 0))
+                y = float(text.get('y', 0))
+            
+            label = GridLabel(content, x, y)
+            if content.startswith('0'):
+                horizontal_labels.append(label)
+            else:
+                vertical_labels.append(label)
+    
+    # Sortuj etykiety
+    vertical_labels.sort(key=lambda l: l.y)
+    horizontal_labels.sort(key=lambda l: l.x)
     
     # Znajdź wszystkie elementy <path>
-    paths = root.findall(".//{http://www.w3.org/2000/svg}path")
+    paths = root.findall(".//svg:path", ns)
     
-    rectangles = []
     for path in paths:
         d = path.get('d')
         if d:
             coords = parse_path(d)
             if len(coords) == 4:  # Upewnij się, że to prostokąt (M x y h width v height)
-                rect = Rectangle(coords[0], coords[1], abs(coords[2]), abs(coords[3]))
-                rectangles.append((rect, path))
-    
-    # Znajdź prostokąty o boku 9.12
-    target_rectangles = []
-    for rect, path in rectangles:
-        if abs(rect.width - 9.12) < 0.01 or abs(rect.height - 9.12) < 0.01:
-            target_rectangles.append((rect, path))
-    
-    # Modyfikuj znalezione prostokąty
-    for rect, path in target_rectangles:
-        # Dodaj zielone półprzezroczyste wypełnienie
-        path.set('fill', 'rgba(0, 255, 0, 0.5)')
-        
-        # Znajdź współrzędne siatki
-        x_coord = int((rect.x - 7.8) / 7.8)  # Zakładamy, że pierwsza kolumna to 001
-        y_coord = int((rect.y - 7.8) / 7.8)  # Zakładamy, że pierwszy wiersz to 02A
-        
-        x_label = f"{x_coord+1:03d}"
-        y_label = f"02{chr(65 + y_coord)}"
-        
-        # Ustaw ID
-        path.set('id', f"{y_label}.{x_label}")
-        
-        # Dodaj tekst do środka prostokąta
-        text = ET.SubElement(root, '{http://www.w3.org/2000/svg}text')
-        text.set('x', str(rect.x + rect.width / 2))
-        text.set('y', str(rect.y + rect.height / 2))
-        text.set('text-anchor', 'middle')
-        text.set('dominant-baseline', 'central')
-        text.set('font-size', '4')
-        text.text = f"{y_label}.{x_label}"
+                rect_x, rect_y = coords[0], coords[1]
+                rect_width, rect_height = abs(coords[2]), abs(coords[3])
+                
+                # Sprawdź, czy to interesujący nas prostokąt
+                if abs(rect_width - 9.12) < 0.01 and abs(rect_height - 9.12) < 0.01:
+                    # Znajdź najbliższe etykiety
+                    vertical_label = min(vertical_labels, key=lambda l: abs(l.x - rect_x))
+                    horizontal_label = min(horizontal_labels, key=lambda l: abs(l.y - rect_y))
+                    
+                    # Utwórz ID
+                    rect_id = f"{vertical_label.text}.{horizontal_label.text}"
+                    
+                    # Ustaw atrybuty prostokąta
+                    path.set('id', rect_id)
+                    path.set('fill', 'rgba(0, 255, 0, 0.5)')
+                    
+                    # Dodaj tekst do środka prostokąta
+                    text = ET.SubElement(root, '{http://www.w3.org/2000/svg}text')
+                    text.set('x', str(rect_x + rect_width / 2))
+                    text.set('y', str(rect_y + rect_height / 2))
+                    text.set('text-anchor', 'middle')
+                    text.set('dominant-baseline', 'central')
+                    text.set('font-size', '4')
+                    text.text = rect_id
     
     return ET.tostring(root, encoding='unicode')
 
