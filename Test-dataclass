@@ -1,0 +1,36 @@
+from dataclasses import dataclass
+
+@dataclass
+class FirstDataClass:
+    a: int = 15
+    b: int = 25
+    c: int = 35
+    d: int = 42
+    e: int = 8
+
+@dataclass
+class SecondDataClass:
+    v: int = 5
+    w: int = 12
+    x: int = 18
+    y: int = 27
+    z: int = 40
+
+def find_closest_value(target, values):
+    return min(values, key=lambda x: abs(x - target))
+
+# Tworzenie instancji obu klas
+first = FirstDataClass()
+second = SecondDataClass()
+
+# Lista elementów z FirstDataClass, które chcemy porównać
+elements_to_compare = ['a', 'c', 'e']
+
+for attr in elements_to_compare:
+    value = getattr(first, attr)
+    closest_value = find_closest_value(value, second.__dict__.values())
+    closest_attr = next(attr for attr, val in second.__dict__.items() if val == closest_value)
+    
+    print(f"Dla {attr} ({value}) z FirstDataClass, najbliższa wartość w SecondDataClass to {closest_attr} ({closest_value})")
+    print(f"  Różnica: {abs(value - closest_value)}")
+    print()
