@@ -1,0 +1,89 @@
+import aiohttp
+import asyncio
+import time
+from typing import List, Dict
+import logging
+
+class OpenManagerAPIClient:
+    def __init__(self, base_url: str, username: str, password: str):
+        self.base_url = base_url
+        self.auth = {
+            'username': username,
+            'password': password
+        }
+        self.session_token = None
+        self.headers = {}
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+
+    async def authenticate(self, session: aiohttp.ClientSession) -> None:
+        """Authenticate and get session token"""
+        auth_url = f"{self.base_url}/api/oauth/login"
+        try:
+            async with session.post(auth_url, json=self.auth) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    self.session_token = data.get('token')
+                    self.headers = {'Authorization': f'Bearer {self.session_token}'}
+                else:
+                    raise Exception(f"Authentication failed with status {response.status}")
+        except Exception as e:
+            self.logger.error(f"Authentication error: {str(e)}")
+            raise
+
+    async def fetch_device_data(self, session: aiohttp.ClientSession, ip: str) -> Dict:
+        """Fetch data for a single device"""
+        device_url = f"{self.base_url}/api/devices?filter=ipAddress eq '{ip}'"
+        try:
+            async with session.get(device_url, headers=self.headers) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    self.logger.warning(f"Failed to fetch data for IP {ip}: Status {response.status}")
+                    return {'ip': ip, 'error': f'Status {response.status}'}
+        except Exception as e:
+            self.logger.error(f"Error fetching data for IP {ip}: {str(e)}")
+            return {'ip': ip, 'error': str(e)}
+
+    async def fetch_all_devices(self, ips: List[str], batch_size: int = 5) -> List[Dict]:
+        """Fetch data for multiple devices with batching"""
+        all_results = []
+        
+        async with aiohttp.ClientSession() as session:
+            # First authenticate
+            await self.authenticate(session)
+            
+            # Process IPs in batches
+            for i in range(0, len(ips), batch_size):
+                batch = ips[i:i + batch_size]
+                tasks = [self.fetch_device_data(session, ip) for ip in batch]
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                all_results.extend(batch_results)
+                
+                # Small delay between batches to prevent rate limiting
+                if i + batch_size < len(ips):
+                    await asyncio.sleep(0.5)
+        
+        return all_results
+
+async def main():
+    # Example usage
+    base_url = "https://your-openmanager-enterprise-url"
+    client = OpenManagerAPIClient(
+        base_url=base_url,
+        username="your_username",
+        password="your_password"
+    )
+    
+    # Example list of IPs
+    ips = [f"192.168.1.{i}" for i in range(1, 21)]  # 20 IPs
+    
+    start_time = time.time()
+    results = await client.fetch_all_devices(ips)
+    end_time = time.time()
+    
+    print(f"Fetched data for {len(ips)} devices in {end_time - start_time:.2f} seconds")
+    return results
+
+if __name__ == "__main__":
+    asyncio.run(main())
