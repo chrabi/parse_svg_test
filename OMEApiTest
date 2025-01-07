@@ -1,0 +1,202 @@
+import requests
+import json
+import pandas as pd
+import asyncio
+import aiohttp
+from datetime import datetime
+from typing import List, Dict
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+class OMEPowerMonitor:
+    def __init__(self, base_url: str, username: str, password: str):
+        self.base_url = base_url.rstrip('/')
+        self.username = username
+        self.password = password
+        self.session_id = None
+        self.headers = {'Content-Type': 'application/json'}
+        self.async_session = None
+    
+    def authenticate(self) -> None:
+        """Authenticate with OME and get session ID"""
+        auth_url = f"{self.base_url}/api/SessionService/Sessions"
+        auth_payload = {
+            "UserName": self.username,
+            "Password": self.password,
+            "SessionType": "API"
+        }
+        
+        try:
+            response = requests.post(
+                auth_url,
+                verify=False,
+                json=auth_payload
+            )
+            if response.status_code == 201:
+                self.session_id = response.headers.get('X-Auth-Token')
+                self.headers['X-Auth-Token'] = self.session_id
+            else:
+                raise Exception(f"Authentication failed with status code {response.status_code}")
+        except Exception as e:
+            raise Exception(f"Authentication error: {str(e)}")
+
+    async def initialize_async_session(self):
+        """Initialize async session with authentication"""
+        if self.session_id is None:
+            self.authenticate()
+        
+        self.async_session = aiohttp.ClientSession(
+            headers=self.headers,
+            connector=aiohttp.TCPConnector(verify_ssl=False)
+        )
+        return self
+
+    async def close_async_session(self):
+        """Close the async session"""
+        if self.async_session:
+            await self.async_session.close()
+
+    def get_all_devices(self) -> List[Dict]:
+        """Get list of all devices from OME with pagination handling"""
+        devices = []
+        next_link = f"{self.base_url}/api/DeviceService/Devices"
+        
+        try:
+            while next_link:
+                response = requests.get(
+                    next_link,
+                    headers=self.headers,
+                    verify=False
+                )
+                
+                if response.status_code != 200:
+                    raise Exception(f"Failed to get devices. Status code: {response.status_code}")
+                
+                data = response.json()
+                
+                # Get total count and current count
+                total_count = data.get('@odata.count', 0)
+                current_devices = data.get('value', [])
+                devices.extend(current_devices)
+                
+                # Check if we have all devices
+                if len(devices) >= total_count:
+                    break
+                
+                # Get next link or break if none
+                next_link = data.get('@odata.nextLink')
+                if next_link:
+                    # If nextLink is a relative path, make it absolute
+                    if not next_link.startswith('http'):
+                        next_link = f"{self.base_url}{next_link}"
+                else:
+                    break
+                
+                print(f"Retrieved {len(devices)} of {total_count} devices...")
+            
+            print(f"Retrieved all {len(devices)} devices successfully.")
+            return devices
+            
+        except Exception as e:
+            raise Exception(f"Error getting devices: {str(e)}")
+
+    async def get_device_power_usage(self, device_id: int) -> Dict:
+        """Get power usage for a specific device"""
+        power_url = f"{self.base_url}/api/DeviceService/Devices({device_id})/PowerUsageByDevice"
+        
+        try:
+            async with self.async_session.get(power_url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return {
+                        'device_id': device_id,
+                        'timestamp': datetime.now().isoformat(),
+                        'power_data': data
+                    }
+                else:
+                    return {
+                        'device_id': device_id,
+                        'timestamp': datetime.now().isoformat(),
+                        'error': f"Failed to get power data. Status: {response.status}"
+                    }
+        except Exception as e:
+            return {
+                'device_id': device_id,
+                'timestamp': datetime.now().isoformat(),
+                'error': str(e)
+            }
+
+    async def collect_all_power_data(self) -> List[Dict]:
+        """Collect power usage data for all devices concurrently"""
+        devices = self.get_all_devices()
+        device_ids = [device['Id'] for device in devices]
+        
+        async with self as monitor:
+            # Gather power data for all devices concurrently
+            power_data = await asyncio.gather(
+                *[monitor.get_device_power_usage(device_id) for device_id in device_ids]
+            )
+        
+        # Combine device info with power data
+        result = []
+        for device, power_info in zip(devices, power_data):
+            combined_data = {
+                'device_id': device['Id'],
+                'device_name': device['DeviceName'],
+                'device_model': device['Model'],
+                'device_type': device['Type'],
+                'service_tag': device['DeviceServiceTag'],
+                'timestamp': power_info['timestamp']
+            }
+            
+            if 'error' in power_info:
+                combined_data['error'] = power_info['error']
+            else:
+                combined_data.update(power_info['power_data'])
+            
+            result.append(combined_data)
+        
+        return result
+
+    async def __aenter__(self):
+        await self.initialize_async_session()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close_async_session()
+
+def save_power_data(data: List[Dict], base_filename: str = "power_usage"):
+    """Save power usage data to both JSON and CSV formats"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Save to JSON
+    json_filename = f"{base_filename}_{timestamp}.json"
+    with open(json_filename, 'w') as f:
+        json.dump(data, f, indent=2)
+    
+    # Save to CSV
+    csv_filename = f"{base_filename}_{timestamp}.csv"
+    df = pd.DataFrame(data)
+    df.to_csv(csv_filename, index=False)
+    
+    return json_filename, csv_filename
+
+async def main():
+    # Configuration
+    OME_BASE_URL = "https://your-ome-server"  # Replace with your OME server URL
+    USERNAME = "your_username"
+    PASSWORD = "your_password"
+    
+    try:
+        monitor = OMEPowerMonitor(OME_BASE_URL, USERNAME, PASSWORD)
+        power_data = await monitor.collect_all_power_data()
+        
+        # Save the data
+        json_file, csv_file = save_power_data(power_data)
+        print(f"Data saved to:\n - {json_file}\n - {csv_file}")
+        
+    except Exception as e:
+        print(f"Error occurred: {str(e)}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
