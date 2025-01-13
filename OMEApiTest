@@ -4,11 +4,12 @@ import pandas as pd
 import asyncio
 import aiohttp
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Any
 import urllib3
+from concurrent.futures import ThreadPoolExecutor
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-class OMEPowerMonitor:
+class OMEMetricsCollector:
     def __init__(self, base_url: str, username: str, password: str):
         self.base_url = base_url.rstrip('/')
         self.username = username
@@ -40,22 +41,6 @@ class OMEPowerMonitor:
         except Exception as e:
             raise Exception(f"Authentication error: {str(e)}")
 
-    async def initialize_async_session(self):
-        """Initialize async session with authentication"""
-        if self.session_id is None:
-            self.authenticate()
-        
-        self.async_session = aiohttp.ClientSession(
-            headers=self.headers,
-            connector=aiohttp.TCPConnector(verify_ssl=False)
-        )
-        return self
-
-    async def close_async_session(self):
-        """Close the async session"""
-        if self.async_session:
-            await self.async_session.close()
-
     def get_all_devices(self) -> List[Dict]:
         """Get list of all devices from OME with pagination handling"""
         devices = []
@@ -74,85 +59,105 @@ class OMEPowerMonitor:
                 
                 data = response.json()
                 
-                # Get total count and current count
                 total_count = data.get('@odata.count', 0)
                 current_devices = data.get('value', [])
                 devices.extend(current_devices)
                 
-                # Check if we have all devices
                 if len(devices) >= total_count:
                     break
                 
-                # Get next link or break if none
                 next_link = data.get('@odata.nextLink')
-                if next_link:
-                    # If nextLink is a relative path, make it absolute
-                    if not next_link.startswith('http'):
-                        next_link = f"{self.base_url}{next_link}"
-                else:
-                    break
+                if next_link and not next_link.startswith('http'):
+                    next_link = f"{self.base_url}{next_link}"
                 
                 print(f"Retrieved {len(devices)} of {total_count} devices...")
             
-            print(f"Retrieved all {len(devices)} devices successfully.")
             return devices
             
         except Exception as e:
             raise Exception(f"Error getting devices: {str(e)}")
 
-    async def get_device_power_usage(self, device_id: int) -> Dict:
-        """Get power usage for a specific device"""
-        power_url = f"{self.base_url}/api/DeviceService/Devices({device_id})/PowerUsageByDevice"
+    async def initialize_async_session(self):
+        """Initialize async session with authentication"""
+        if self.session_id is None:
+            self.authenticate()
+        
+        self.async_session = aiohttp.ClientSession(
+            headers=self.headers,
+            connector=aiohttp.TCPConnector(verify_ssl=False)
+        )
+        return self
+
+    async def close_async_session(self):
+        """Close the async session"""
+        if self.async_session:
+            await self.async_session.close()
+
+    async def get_device_metric(self, device_id: int, endpoint: str) -> Dict[str, Any]:
+        """Generic method to get device metrics from any endpoint"""
+        url = f"{self.base_url}/api/DeviceService/Devices({device_id}){endpoint}"
         
         try:
-            async with self.async_session.get(power_url) as response:
+            async with self.async_session.get(url) as response:
                 if response.status == 200:
-                    data = await response.json()
-                    return {
-                        'device_id': device_id,
-                        'timestamp': datetime.now().isoformat(),
-                        'power_data': data
-                    }
-                else:
-                    return {
-                        'device_id': device_id,
-                        'timestamp': datetime.now().isoformat(),
-                        'error': f"Failed to get power data. Status: {response.status}"
-                    }
+                    return await response.json()
+                return {'error': f"Failed to get data from {endpoint}. Status: {response.status}"}
         except Exception as e:
-            return {
-                'device_id': device_id,
-                'timestamp': datetime.now().isoformat(),
-                'error': str(e)
-            }
+            return {'error': f"Error getting data from {endpoint}: {str(e)}"}
 
-    async def collect_all_power_data(self) -> List[Dict]:
-        """Collect power usage data for all devices concurrently"""
+    async def get_device_all_metrics(self, device_id: int) -> Dict[str, Any]:
+        """Collect all metrics for a single device concurrently"""
+        endpoints = {
+            'power': '/PowerUsageByDevice',
+            'temperature': '/TemperatureMetricsByDevice',
+            'details': '',  # Base device details
+            'cpu': '/ProcessorInformation'
+        }
+        
+        # Gather all metrics concurrently
+        tasks = {
+            metric: self.get_device_metric(device_id, endpoint)
+            for metric, endpoint in endpoints.items()
+        }
+        
+        results = await asyncio.gather(*tasks.values())
+        return dict(zip(tasks.keys(), results))
+
+    async def collect_all_devices_metrics(self) -> List[Dict]:
+        """Collect all metrics for all devices concurrently"""
         devices = self.get_all_devices()
-        device_ids = [device['Id'] for device in devices]
         
-        async with self as monitor:
-            # Gather power data for all devices concurrently
-            power_data = await asyncio.gather(
-                *[monitor.get_device_power_usage(device_id) for device_id in device_ids]
-            )
+        async with self as collector:
+            # Collect metrics for all devices concurrently
+            all_metrics = await asyncio.gather(*[
+                collector.get_device_all_metrics(device['Id'])
+                for device in devices
+            ])
         
-        # Combine device info with power data
+        # Combine device info with metrics
         result = []
-        for device, power_info in zip(devices, power_data):
+        timestamp = datetime.now().isoformat()
+        
+        for device, metrics in zip(devices, all_metrics):
             combined_data = {
+                'timestamp': timestamp,
                 'device_id': device['Id'],
                 'device_name': device['DeviceName'],
                 'device_model': device['Model'],
                 'device_type': device['Type'],
                 'service_tag': device['DeviceServiceTag'],
-                'timestamp': power_info['timestamp']
             }
             
-            if 'error' in power_info:
-                combined_data['error'] = power_info['error']
-            else:
-                combined_data.update(power_info['power_data'])
+            # Flatten and add metrics
+            for metric_type, metric_data in metrics.items():
+                if isinstance(metric_data, dict) and 'error' not in metric_data:
+                    # Add prefix to avoid key conflicts
+                    metric_data = {f"{metric_type}_{k}": v 
+                                 for k, v in metric_data.items()
+                                 if k not in ['@odata.context', '@odata.type']}
+                    combined_data.update(metric_data)
+                else:
+                    combined_data[f"{metric_type}_error"] = metric_data.get('error', 'Unknown error')
             
             result.append(combined_data)
         
@@ -165,8 +170,8 @@ class OMEPowerMonitor:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close_async_session()
 
-def save_power_data(data: List[Dict], base_filename: str = "power_usage"):
-    """Save power usage data to both JSON and CSV formats"""
+def save_metrics_data(data: List[Dict], base_filename: str = "device_metrics"):
+    """Save metrics data to both JSON and CSV formats"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     # Save to JSON
@@ -174,25 +179,26 @@ def save_power_data(data: List[Dict], base_filename: str = "power_usage"):
     with open(json_filename, 'w') as f:
         json.dump(data, f, indent=2)
     
-    # Save to CSV
+    # Save to CSV - flatten nested structures
     csv_filename = f"{base_filename}_{timestamp}.csv"
-    df = pd.DataFrame(data)
+    df = pd.json_normalize(data)
     df.to_csv(csv_filename, index=False)
     
     return json_filename, csv_filename
 
 async def main():
     # Configuration
-    OME_BASE_URL = "https://your-ome-server"  # Replace with your OME server URL
+    OME_BASE_URL = "https://your-ome-server"
     USERNAME = "your_username"
     PASSWORD = "your_password"
     
     try:
-        monitor = OMEPowerMonitor(OME_BASE_URL, USERNAME, PASSWORD)
-        power_data = await monitor.collect_all_power_data()
+        collector = OMEMetricsCollector(OME_BASE_URL, USERNAME, PASSWORD)
+        print("Collecting metrics for all devices...")
+        metrics_data = await collector.collect_all_devices_metrics()
         
         # Save the data
-        json_file, csv_file = save_power_data(power_data)
+        json_file, csv_file = save_metrics_data(metrics_data)
         print(f"Data saved to:\n - {json_file}\n - {csv_file}")
         
     except Exception as e:
