@@ -4,6 +4,7 @@ import concurrent.futures
 import sys
 import os
 import logging
+import time
 from datetime import datetime, timezone
 
 # Konfiguracja logowania
@@ -18,13 +19,35 @@ logging.basicConfig(
 
 # Konfiguracja
 BASE_URL = "https://{ip}/api/DeviceService"  # Podstawowy URL do API OME
+SESSION_ENDPOINT = "/SessionService/Sessions"  # Endpoint do uwierzytelniania
 DEVICES_ENDPOINT = "/Devices"  # Endpoint do pobierania listy urządzeń
 HEADERS = {
-    "Content-Type": "application/json",
-    "X-Auth-Token": "your_auth_token_here"  # Zastąp tokenem uwierzytelniającym
+    "Content-Type": "application/json"
 }
 
 OUTPUT_DIR = "out_files"  # Główny katalog wynikowy
+
+def authenticate(ip, username, password):
+    """
+    Uwierzytelnia użytkownika i zwraca token sesji (X-Auth-Token).
+    """
+    url = BASE_URL.format(ip=ip).replace("DeviceService", "") + SESSION_ENDPOINT
+    payload = {
+        "UserName": username,
+        "Password": password,
+        "SessionType": "API"
+    }
+    try:
+        response = requests.post(url, json=payload, headers=HEADERS, verify=False)  # verify=False wyłącza weryfikację SSL
+        response.raise_for_status()
+        session_id = response.headers.get("X-Auth-Token")
+        if not session_id:
+            logging.error("Nie udało się uzyskać tokenu sesji.")
+            return None
+        return session_id
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Błąd podczas uwierzytelniania: {e}")
+        return None
 
 def parse_date_to_epoch(date_str):
     """
@@ -58,11 +81,11 @@ def parse_date_to_epoch(date_str):
     logging.warning(f"Nie można sparsować daty: {date_str}")
     return None
 
-def fetch_all_devices(ip):
+def fetch_all_devices(ip, chunksize):
     """
     Pobiera wszystkie urządzenia z paginacją (@odata.nextLink).
     """
-    url = BASE_URL.format(ip=ip) + DEVICES_ENDPOINT
+    url = BASE_URL.format(ip=ip) + DEVICES_ENDPOINT + f"?$top={chunksize}"
     all_devices = []
 
     while url:
@@ -147,8 +170,8 @@ def process_endpoint(ip, endpoint_name, endpoint_path, devices, output_dir):
         selected_columns = ["DeviceId_IP", "DeviceId", "SerialNumber"]
         if endpoint_name == "CPU":
             selected_columns.extend(["CpuName", "Model", "CoreNumber"])
-        elif endpoint_name == "InventoryDetails":
-            selected_columns.extend(["ModelName", "Name", "DeviceManagement", "Type"])
+        elif endpoint_name == "Temperature":
+            selected_columns.extend(["Temperature", "Status"])
 
         # Utwórz nazwę pliku
         ip_without_dots = ip.replace(".", "")
@@ -158,17 +181,30 @@ def process_endpoint(ip, endpoint_name, endpoint_path, devices, output_dir):
         # Zapisz dane do pliku CSV
         save_to_csv(all_data, filename, selected_columns)
 
-def main(ip):
+def main(ip, chunksize=300):
     """
     Główna funkcja skryptu.
     """
+    start_time = time.time()  # Początek pomiaru czasu
+
+    # Uwierzytelnianie
+    username = "admin"  # Zastąp prawdziwą nazwą użytkownika
+    password = "password"  # Zastąp prawdziwym hasłem
+    session_id = authenticate(ip, username, password)
+    if not session_id:
+        logging.error("Nie udało się uwierzytelnić.")
+        return
+
+    # Ustaw token sesji w nagłówkach
+    HEADERS["X-Auth-Token"] = session_id
+
     # Utwórz katalog wynikowy
     output_dir = os.path.join(OUTPUT_DIR, ip.replace(".", ""))
     os.makedirs(output_dir, exist_ok=True)
     logging.info(f"Utworzono katalog wynikowy: {output_dir}")
 
     # Pobierz wszystkie urządzenia z paginacją
-    devices = fetch_all_devices(ip)
+    devices = fetch_all_devices(ip, chunksize)
     if not devices:
         logging.error("Nie udało się pobrać listy urządzeń.")
         return
@@ -205,10 +241,15 @@ def main(ip):
         # Czekaj na zakończenie wszystkich wątków
         concurrent.futures.wait(futures)
 
+    # Pomiar czasu wykonania
+    end_time = time.time()
+    logging.info(f"Czas wykonania skryptu: {end_time - start_time:.2f} sekund")
+
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        logging.error("Użycie: python skrypt.py <IP>")
+    if len(sys.argv) < 2:
+        logging.error("Użycie: python skrypt.py <IP> [chunksize]")
         sys.exit(1)
 
     ip = sys.argv[1]
-    main(ip)
+    chunksize = int(sys.argv[2]) if len(sys.argv) > 2 else 300  # Domyślnie 300
+    main(ip, chunksize)
