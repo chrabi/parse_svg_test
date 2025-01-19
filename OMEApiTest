@@ -1,208 +1,214 @@
 import requests
-import json
-import pandas as pd
-import asyncio
-import aiohttp
-from datetime import datetime
-from typing import List, Dict, Any
-import urllib3
-from concurrent.futures import ThreadPoolExecutor
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import csv
+import concurrent.futures
+import sys
+import os
+import logging
+from datetime import datetime, timezone
 
-class OMEMetricsCollector:
-    def __init__(self, base_url: str, username: str, password: str):
-        self.base_url = base_url.rstrip('/')
-        self.username = username
-        self.password = password
-        self.session_id = None
-        self.headers = {'Content-Type': 'application/json'}
-        self.async_session = None
-    
-    def authenticate(self) -> None:
-        """Authenticate with OME and get session ID"""
-        auth_url = f"{self.base_url}/api/SessionService/Sessions"
-        auth_payload = {
-            "UserName": self.username,
-            "Password": self.password,
-            "SessionType": "API"
-        }
-        
+# Konfiguracja logowania
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("script.log"),
+        logging.StreamHandler()
+    ]
+)
+
+# Konfiguracja
+BASE_URL = "https://{ip}/api/DeviceService"  # Podstawowy URL do API OME
+DEVICES_ENDPOINT = "/Devices"  # Endpoint do pobierania listy urządzeń
+HEADERS = {
+    "Content-Type": "application/json",
+    "X-Auth-Token": "your_auth_token_here"  # Zastąp tokenem uwierzytelniającym
+}
+
+OUTPUT_DIR = "out_files"  # Główny katalog wynikowy
+
+def parse_date_to_epoch(date_str):
+    """
+    Konwertuje różne formaty daty do czasu UTC, a następnie do formatu epoch.
+    Obsługuje formaty ISO, Windows i inne.
+    """
+    if not date_str:
+        return None
+
+    # Próbuj różne formaty daty
+    formats = [
+        "%Y-%m-%dT%H:%M:%S.%fZ",  # ISO format z czasem UTC (np. 2023-10-10T12:34:56.789Z)
+        "%Y-%m-%dT%H:%M:%S.%f%z", # ISO format z informacją o strefie czasowej (np. 2023-10-10T12:34:56.789+02:00)
+        "%Y-%m-%d %H:%M:%S",      # Windows format (bez strefy czasowej)
+        "%Y/%m/%d %H:%M:%S",      # Inny format (bez strefy czasowej)
+    ]
+
+    for fmt in formats:
         try:
-            response = requests.post(
-                auth_url,
-                verify=False,
-                json=auth_payload
-            )
-            if response.status_code == 201:
-                self.session_id = response.headers.get('X-Auth-Token')
-                self.headers['X-Auth-Token'] = self.session_id
+            dt = datetime.strptime(date_str, fmt)
+            # Jeśli data ma informację o strefie czasowej, przekonwertuj do UTC
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc)
             else:
-                raise Exception(f"Authentication failed with status code {response.status_code}")
-        except Exception as e:
-            raise Exception(f"Authentication error: {str(e)}")
+                # Załóż, że data jest już w UTC
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())  # Konwertuj do epoch
+        except ValueError:
+            continue
 
-    def get_all_devices(self) -> List[Dict]:
-        """Get list of all devices from OME with pagination handling"""
-        devices = []
-        next_link = f"{self.base_url}/api/DeviceService/Devices"
-        
+    logging.warning(f"Nie można sparsować daty: {date_str}")
+    return None
+
+def fetch_all_devices(ip):
+    """
+    Pobiera wszystkie urządzenia z paginacją (@odata.nextLink).
+    """
+    url = BASE_URL.format(ip=ip) + DEVICES_ENDPOINT
+    all_devices = []
+
+    while url:
         try:
-            while next_link:
-                response = requests.get(
-                    next_link,
-                    headers=self.headers,
-                    verify=False
-                )
-                
-                if response.status_code != 200:
-                    raise Exception(f"Failed to get devices. Status code: {response.status_code}")
-                
-                data = response.json()
-                
-                total_count = data.get('@odata.count', 0)
-                current_devices = data.get('value', [])
-                devices.extend(current_devices)
-                
-                if len(devices) >= total_count:
-                    break
-                
-                next_link = data.get('@odata.nextLink')
-                if next_link and not next_link.startswith('http'):
-                    next_link = f"{self.base_url}{next_link}"
-                
-                print(f"Retrieved {len(devices)} of {total_count} devices...")
-            
-            return devices
-            
-        except Exception as e:
-            raise Exception(f"Error getting devices: {str(e)}")
+            response = requests.get(url, headers=HEADERS, verify=False)  # verify=False wyłącza weryfikację SSL
+            response.raise_for_status()
+            data = response.json()
+            all_devices.extend(data.get("value", []))
+            url = data.get("@odata.nextLink")  # Pobierz kolejną stronę danych
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Błąd podczas pobierania listy urządzeń z {url}: {e}")
+            break
 
-    async def initialize_async_session(self):
-        """Initialize async session with authentication"""
-        if self.session_id is None:
-            self.authenticate()
-        
-        self.async_session = aiohttp.ClientSession(
-            headers=self.headers,
-            connector=aiohttp.TCPConnector(verify_ssl=False)
-        )
-        return self
+    return all_devices
 
-    async def close_async_session(self):
-        """Close the async session"""
-        if self.async_session:
-            await self.async_session.close()
-
-    async def get_device_metric(self, device_id: int, endpoint: str) -> Dict[str, Any]:
-        """Generic method to get device metrics from any endpoint"""
-        url = f"{self.base_url}/api/DeviceService/Devices({device_id}){endpoint}"
-        
-        try:
-            async with self.async_session.get(url) as response:
-                if response.status == 200:
-                    return await response.json()
-                return {'error': f"Failed to get data from {endpoint}. Status: {response.status}"}
-        except Exception as e:
-            return {'error': f"Error getting data from {endpoint}: {str(e)}"}
-
-    async def get_device_all_metrics(self, device_id: int) -> Dict[str, Any]:
-        """Collect all metrics for a single device concurrently"""
-        endpoints = {
-            'power': '/PowerUsageByDevice',
-            'temperature': '/TemperatureMetricsByDevice',
-            'details': '',  # Base device details
-            'cpu': '/ProcessorInformation'
-        }
-        
-        # Gather all metrics concurrently
-        tasks = {
-            metric: self.get_device_metric(device_id, endpoint)
-            for metric, endpoint in endpoints.items()
-        }
-        
-        results = await asyncio.gather(*tasks.values())
-        return dict(zip(tasks.keys(), results))
-
-    async def collect_all_devices_metrics(self) -> List[Dict]:
-        """Collect all metrics for all devices concurrently"""
-        devices = self.get_all_devices()
-        
-        async with self as collector:
-            # Collect metrics for all devices concurrently
-            all_metrics = await asyncio.gather(*[
-                collector.get_device_all_metrics(device['Id'])
-                for device in devices
-            ])
-        
-        # Combine device info with metrics
-        result = []
-        timestamp = datetime.now().isoformat()
-        
-        for device, metrics in zip(devices, all_metrics):
-            combined_data = {
-                'timestamp': timestamp,
-                'device_id': device['Id'],
-                'device_name': device['DeviceName'],
-                'device_model': device['Model'],
-                'device_type': device['Type'],
-                'service_tag': device['DeviceServiceTag'],
-            }
-            
-            # Flatten and add metrics
-            for metric_type, metric_data in metrics.items():
-                if isinstance(metric_data, dict) and 'error' not in metric_data:
-                    # Add prefix to avoid key conflicts
-                    metric_data = {f"{metric_type}_{k}": v 
-                                 for k, v in metric_data.items()
-                                 if k not in ['@odata.context', '@odata.type']}
-                    combined_data.update(metric_data)
-                else:
-                    combined_data[f"{metric_type}_error"] = metric_data.get('error', 'Unknown error')
-            
-            result.append(combined_data)
-        
-        return result
-
-    async def __aenter__(self):
-        await self.initialize_async_session()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.close_async_session()
-
-def save_metrics_data(data: List[Dict], base_filename: str = "device_metrics"):
-    """Save metrics data to both JSON and CSV formats"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Save to JSON
-    json_filename = f"{base_filename}_{timestamp}.json"
-    with open(json_filename, 'w') as f:
-        json.dump(data, f, indent=2)
-    
-    # Save to CSV - flatten nested structures
-    csv_filename = f"{base_filename}_{timestamp}.csv"
-    df = pd.json_normalize(data)
-    df.to_csv(csv_filename, index=False)
-    
-    return json_filename, csv_filename
-
-async def main():
-    # Configuration
-    OME_BASE_URL = "https://your-ome-server"
-    USERNAME = "your_username"
-    PASSWORD = "your_password"
-    
+def fetch_data(ip, device_id, endpoint):
+    """
+    Pobiera dane z danego endpointu dla konkretnego deviceId.
+    """
+    url = BASE_URL.format(ip=ip) + f"/Devices({device_id}){endpoint}"
     try:
-        collector = OMEMetricsCollector(OME_BASE_URL, USERNAME, PASSWORD)
-        print("Collecting metrics for all devices...")
-        metrics_data = await collector.collect_all_devices_metrics()
+        response = requests.get(url, headers=HEADERS, verify=False)  # verify=False wyłącza weryfikację SSL
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Błąd podczas pobierania danych z {url}: {e}")
+        return None
+
+def save_to_csv(data, filename, selected_columns=None):
+    """
+    Zapisuje dane do pliku CSV.
+    """
+    if not data:
+        logging.warning(f"Brak danych do zapisania w {filename}.")
+        return
+
+    # Filtruj kolumny, jeśli podano
+    if selected_columns:
+        filtered_data = []
+        for item in data:
+            filtered_item = {key: item.get(key, "") for key in selected_columns}
+            filtered_data.append(filtered_item)
+        data = filtered_data
+
+    # Konwertuj pola dat do formatu epoch, jeśli istnieją
+    for item in data:
+        for key, value in item.items():
+            if isinstance(value, str) and "date" in key.lower():
+                epoch_time = parse_date_to_epoch(value)
+                if epoch_time:
+                    item[key] = epoch_time
+
+    # Zapisz do pliku CSV
+    keys = data[0].keys() if isinstance(data, list) and len(data) > 0 else []
+    with open(filename, mode='w', newline='') as file:
+        writer = csv.DictWriter(file, fieldnames=keys)
+        writer.writeheader()
+        if isinstance(data, list):
+            writer.writerows(data)
+        else:
+            writer.writerow(data)
+    logging.info(f"Dane zapisane do {filename}.")
+
+def process_endpoint(ip, endpoint_name, endpoint_path, devices, output_dir):
+    """
+    Przetwarza dane dla danego endpointu i zapisuje je do pliku CSV.
+    """
+    all_data = []
+    for device in devices:
+        device_id = device["Id"]
+        data = fetch_data(ip, device_id, endpoint_path)
+        if data:
+            # Dodaj DeviceId_IP i SerialNumber do każdego wiersza danych
+            for item in data:
+                item["DeviceId_IP"] = f"{device_id}_{ip.replace('.', '')}"
+                item["DeviceId"] = device_id
+                item["SerialNumber"] = device.get("SerialNumber", "")
+            all_data.extend(data)
+
+    if all_data:
+        # Wybierz odpowiednie kolumny dla określonych endpointów
+        selected_columns = ["DeviceId_IP", "DeviceId", "SerialNumber"]
+        if endpoint_name == "CPU":
+            selected_columns.extend(["CpuName", "Model", "CoreNumber"])
+        elif endpoint_name == "InventoryDetails":
+            selected_columns.extend(["ModelName", "Name", "DeviceManagement", "Type"])
+
+        # Utwórz nazwę pliku
+        ip_without_dots = ip.replace(".", "")
+        generation_time = int(datetime.now().timestamp())
+        filename = os.path.join(output_dir, f"{ip_without_dots}_{endpoint_name.lower()}_{generation_time}.csv")
+
+        # Zapisz dane do pliku CSV
+        save_to_csv(all_data, filename, selected_columns)
+
+def main(ip):
+    """
+    Główna funkcja skryptu.
+    """
+    # Utwórz katalog wynikowy
+    output_dir = os.path.join(OUTPUT_DIR, ip.replace(".", ""))
+    os.makedirs(output_dir, exist_ok=True)
+    logging.info(f"Utworzono katalog wynikowy: {output_dir}")
+
+    # Pobierz wszystkie urządzenia z paginacją
+    devices = fetch_all_devices(ip)
+    if not devices:
+        logging.error("Nie udało się pobrać listy urządzeń.")
+        return
+
+    # Zapisz dane inwentaryzacyjne do osobnego pliku CSV
+    inventory_data = []
+    for device in devices:
+        inventory_data.append({
+            "DeviceId_IP": f"{device['Id']}_{ip.replace('.', '')}",
+            "DeviceId": device["Id"],
+            "SerialNumber": device.get("SerialNumber", ""),
+            "ModelName": device.get("Model", ""),
+            "Name": device.get("Name", ""),
+            "DeviceManagement": device.get("DeviceManagement", ""),
+            "Type": device.get("Type", "")
+        })
+
+    # Zapisz dane inwentaryzacyjne
+    inventory_filename = os.path.join(output_dir, f"{ip.replace('.', '')}_inventory_{int(datetime.now().timestamp())}.csv")
+    save_to_csv(inventory_data, inventory_filename)
+
+    # Endpointy do przetworzenia
+    endpoints = {
+        "CPU": "/Cpu",
+        "Temperature": "/Temperature"
+    }
+
+    # Przetwarzaj każdy endpoint
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = []
+        for endpoint_name, endpoint_path in endpoints.items():
+            futures.append(executor.submit(process_endpoint, ip, endpoint_name, endpoint_path, devices, output_dir))
         
-        # Save the data
-        json_file, csv_file = save_metrics_data(metrics_data)
-        print(f"Data saved to:\n - {json_file}\n - {csv_file}")
-        
-    except Exception as e:
-        print(f"Error occurred: {str(e)}")
+        # Czekaj na zakończenie wszystkich wątków
+        concurrent.futures.wait(futures)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if len(sys.argv) != 2:
+        logging.error("Użycie: python skrypt.py <IP>")
+        sys.exit(1)
+
+    ip = sys.argv[1]
+    main(ip)
