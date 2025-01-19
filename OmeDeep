@@ -1,0 +1,180 @@
+import requests
+import csv
+import concurrent.futures
+import sys
+import os
+import logging
+from datetime import datetime
+
+# Konfiguracja logowania
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("script.log"),
+        logging.StreamHandler()
+    ]
+)
+
+# Konfiguracja
+BASE_URL = "https://{ip}/api"  # Podstawowy URL do API OME
+DEVICES_ENDPOINT = "/Devices"  # Endpoint do pobierania listy urządzeń
+HEADERS = {
+    "Content-Type": "application/json",
+    "X-Auth-Token": "your_auth_token_here"  # Zastąp tokenem uwierzytelniającym
+}
+
+OUTPUT_DIR = "out_files"  # Główny katalog wynikowy
+
+def fetch_devices(ip):
+    """
+    Pobiera listę urządzeń i zwraca ich deviceId.
+    """
+    url = BASE_URL.format(ip=ip) + DEVICES_ENDPOINT
+    try:
+        response = requests.get(url, headers=HEADERS, verify=False)  # verify=False wyłącza weryfikację SSL
+        response.raise_for_status()
+        devices = response.json().get("value", [])
+        return [device["Id"] for device in devices]  # Zwraca listę deviceId
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Błąd podczas pobierania listy urządzeń z {url}: {e}")
+        return []
+
+def fetch_data(ip, device_id, endpoint):
+    """
+    Pobiera dane z danego endpointu dla konkretnego deviceId.
+    """
+    url = BASE_URL.format(ip=ip) + f"/{device_id}{endpoint}"
+    try:
+        response = requests.get(url, headers=HEADERS, verify=False)  # verify=False wyłącza weryfikację SSL
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Błąd podczas pobierania danych z {url}: {e}")
+        return None
+
+def parse_date_to_epoch(date_str):
+    """
+    Konwertuje różne formaty daty do formatu epoch.
+    Obsługuje formaty ISO, Windows i inne.
+    """
+    if not date_str:
+        return None
+
+    # Próbuj różne formaty daty
+    formats = [
+        "%Y-%m-%dT%H:%M:%S.%fZ",  # ISO format
+        "%Y-%m-%d %H:%M:%S",      # Windows format
+        "%Y/%m/%d %H:%M:%S",      # Inny format
+    ]
+
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(date_str, fmt)
+            return int(dt.timestamp())
+        except ValueError:
+            continue
+
+    logging.warning(f"Nie można sparsować daty: {date_str}")
+    return None
+
+def save_to_csv(data, filename, selected_columns=None):
+    """
+    Zapisuje dane do pliku CSV.
+    """
+    if not data:
+        logging.warning(f"Brak danych do zapisania w {filename}.")
+        return
+
+    # Filtruj kolumny, jeśli podano
+    if selected_columns:
+        filtered_data = []
+        for item in data:
+            filtered_item = {key: item.get(key, "") for key in selected_columns}
+            filtered_data.append(filtered_item)
+        data = filtered_data
+
+    # Konwertuj pola dat do formatu epoch, jeśli istnieją
+    for item in data:
+        for key, value in item.items():
+            if isinstance(value, str) and "date" in key.lower():
+                epoch_time = parse_date_to_epoch(value)
+                if epoch_time:
+                    item[key] = epoch_time
+
+    # Zapisz do pliku CSV
+    keys = ["DeviceId_IP"] + list(data[0].keys()) if isinstance(data, list) and len(data) > 0 else ["DeviceId_IP"]
+    with open(filename, mode='w', newline='') as file:
+        writer = csv.DictWriter(file, fieldnames=keys)
+        writer.writeheader()
+        for item in data:
+            item_with_key = {"DeviceId_IP": f"{item.get('DeviceId', '')}_{ip.replace('.', '')}"} | item
+            writer.writerow(item_with_key)
+    logging.info(f"Dane zapisane do {filename}.")
+
+def process_endpoint(ip, endpoint_name, endpoint_path, device_ids, output_dir):
+    """
+    Przetwarza dane dla danego endpointu i zapisuje je do jednego pliku CSV.
+    """
+    all_data = []
+    for device_id in device_ids:
+        data = fetch_data(ip, device_id, endpoint_path)
+        if data:
+            # Dodaj DeviceId do każdego wiersza danych
+            for item in data:
+                item["DeviceId"] = device_id
+            all_data.extend(data)
+
+    if all_data:
+        # Wybierz odpowiednie kolumny dla określonych endpointów
+        selected_columns = None
+        if endpoint_name == "CPU":
+            selected_columns = ["CpuName", "Model", "CoreNumber"]
+        elif endpoint_name == "InventoryDetails":
+            selected_columns = ["SerialNumber", "ModelName", "Name", "DeviceManagement"]
+
+        # Utwórz nazwę pliku
+        ip_without_dots = ip.replace(".", "")
+        generation_time = int(datetime.now().timestamp())
+        filename = os.path.join(output_dir, f"{ip_without_dots}_{endpoint_name.lower()}_{generation_time}.csv")
+
+        # Zapisz dane do pliku CSV
+        save_to_csv(all_data, filename, selected_columns)
+
+def main(ip):
+    """
+    Główna funkcja skryptu.
+    """
+    # Utwórz katalog wynikowy
+    output_dir = os.path.join(OUTPUT_DIR, ip.replace(".", ""))
+    os.makedirs(output_dir, exist_ok=True)
+    logging.info(f"Utworzono katalog wynikowy: {output_dir}")
+
+    # Pobierz listę urządzeń
+    device_ids = fetch_devices(ip)
+    if not device_ids:
+        logging.error("Nie udało się pobrać listy urządzeń.")
+        return
+
+    # Endpointy do przetworzenia
+    endpoints = {
+        "CPU": "/Cpu",
+        "InventoryDetails": "/InventoryDetails"
+    }
+
+    # Przetwarzaj każdy endpoint
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = []
+        for endpoint_name, endpoint_path in endpoints.items():
+            futures.append(executor.submit(process_endpoint, ip, endpoint_name, endpoint_path, device_ids, output_dir))
+        
+        # Czekaj na zakończenie wszystkich wątków
+        concurrent.futures.wait(futures)
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        logging.error("Użycie: python skrypt.py <IP>")
+        sys.exit(1)
+
+    ip = sys.argv[1]
+    main(ip)
