@@ -1,0 +1,57 @@
+import pandas as pd
+import io
+
+def generate_ome_table_sql():
+    # Przykładowe dane CSV
+    csv_data = '''OmeId,DeviceId,SourceLoadTime,Name,Model,Status
+1015113251,1002,738003568,swdcserver.latam.pl,Dell r640,17'''
+    
+    # Wczytanie danych do DataFrame
+    df = pd.read_csv(io.StringIO(csv_data))
+    
+    # Mapowanie typów danych
+    type_mapping = {
+        'OmeId': 'BIGINT PRIMARY KEY',
+        'DeviceId': 'BIGINT',
+        'SourceLoadTime': 'BIGINT',
+        'Name': 'NVARCHAR(255)',
+        'Model': 'NVARCHAR(255)',
+        'Status': 'INT'
+    }
+    
+    # Generowanie SQL dla tworzenia tabeli
+    sql_create = "CREATE TABLE OME_Devices (\n"
+    columns = []
+    
+    for column in df.columns:
+        data_type = type_mapping.get(column)
+        columns.append(f"    {column} {data_type}")
+    
+    sql_create += ",\n".join(columns)
+    sql_create += "\n);"
+    
+    # Generowanie przykładowego INSERT
+    values = df.iloc[0].values
+    formatted_values = []
+    
+    for val in values:
+        if isinstance(val, str):
+            formatted_values.append(f"'{val}'")
+        else:
+            formatted_values.append(str(val))
+            
+    sql_insert = f"""
+INSERT INTO OME_Devices 
+    ({', '.join(df.columns)})
+VALUES
+    ({', '.join(formatted_values)});
+"""
+    
+    return sql_create, sql_insert
+
+# Generowanie i wyświetlenie zapytań SQL
+create_sql, insert_sql = generate_ome_table_sql()
+print("-- Tworzenie tabeli:")
+print(create_sql)
+print("\n-- Przykładowy INSERT:")
+print(insert_sql)
