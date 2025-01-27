@@ -52,6 +52,7 @@ Zużycie pamięci stałe (~200-500 MB niezależnie od wielkości pliku)
 Automatyczne wykorzystanie wszystkich dostępnych rdzeni CPU
 
 """
+
 # Konfiguracja logowania z obsługą UTF-8
 class SafeLogging:
     @staticmethod
@@ -104,8 +105,15 @@ FILE_SPECS = {
                    'peakTemperature', 'avgTemperature', 'startTime', 'peakTemperatureTimeStamp'],
     'InventoryDetailsDisk': ['OmeId', 'DeviceId', 'SourceLoadTimeEpoch', 'SerialNumber',
                             'Id', 'DiskNumber', 'ModelNumber', 'PartNumber', 'Size',
-                            'UsedSpace', 'EncryptionAbility', 'RaidStatus', 'SecurityState', 'Status']
+                            'UsedSpace', 'EncryptionAbility', 'RaidStatus', 'SecurityState', 'Status'],
+    'InventoryDetailsNic' : [
+    'OmeId', 'DeviceId', 'SourceLoadTimeEpoch', 'SerialNumber',
+    'NicId', 'VendorName', 'PortsId', 'InitiatorIpAdress', 'InitiatorSubMask',
+    'LinkStatus', 'LinkSpeed', 'Fqdn', 'CurrentMacAdress', 'VirtualMacAdress',
+    'NicMode', 'MinBandwidth', 'MaxBandwidth'
+]
 }
+
 
 class CSVWriter:
     def __init__(self):
@@ -139,7 +147,7 @@ def process_item(item: Dict[str, Any]) -> Dict[str, list]:
         result['Inventory_base'].append({
             'OmeId': item.get('OmeId', ''),
             'DeviceId': item.get('DeviceId', ''),
-            'SourceLoadTimeEpoch': item.get('TimeEpoch', ''),
+            'SourceLoadTimeEpoch': item.get('SourceLoadTimeEpoch', ''),
             'SerialNumber': item.get('SerialNumber', ''),
             'Model': item.get('Model', ''),
             'Name': item.get('Name', '')
@@ -150,7 +158,7 @@ def process_item(item: Dict[str, Any]) -> Dict[str, list]:
         result['Uptime'].append({
             'OmeId': item.get('OmeId', ''),
             'DeviceId': item.get('DeviceId', ''),
-            'SourceLoadTimeEpoch': item.get('TimeEpoch', ''),
+            'SourceLoadTimeEpoch': item.get('SourceLoadTimeEpoch', ''),
             'SerialNumber': item.get('SerialNumber', ''),
             'systemUptime': uptime_data.get('systemUptime', '') if isinstance(uptime_data, dict) else ''
         })
@@ -160,7 +168,7 @@ def process_item(item: Dict[str, Any]) -> Dict[str, list]:
         result['Temperature'].append({
             'OmeId': item.get('OmeId', ''),
             'DeviceId': item.get('DeviceId', ''),
-            'SourceLoadTimeEpoch': item.get('TimeEpoch', ''),
+            'SourceLoadTimeEpoch': item.get('SourceLoadTimeEpoch', ''),
             'SerialNumber': item.get('SerialNumber', ''),
             'peakTemperature': temp_data.get('peakTemperature', ''),
             'avgTemperature': temp_data.get('avgTemperature', ''),
@@ -174,7 +182,7 @@ def process_item(item: Dict[str, Any]) -> Dict[str, list]:
             result['InventoryDetailsDisk'].append({
                 'OmeId': item.get('OmeId', ''),
                 'DeviceId': item.get('DeviceId', ''),
-                'SourceLoadTimeEpoch': item.get('TimeEpoch', ''),
+                'SourceLoadTimeEpoch': item.get('SourceLoadTimeEpoch', ''),
                 'SerialNumber': item.get('SerialNumber', ''),
                 'Id': disk.get('Id', ''),
                 'DiskNumber': disk.get('DiskNumber', ''),
@@ -187,6 +195,36 @@ def process_item(item: Dict[str, Any]) -> Dict[str, list]:
                 'SecurityState': disk.get('SecurityState', ''),
                 'Status': disk.get('Status', '')
             })
+        
+        #Nic Iterate through each server in the JSON data
+        nic_data = item.get('InventoryDetailsNic_data', {}) or {}
+        for nic in nic_data.get('InventoryInfo', []) if isinstance(nic_data, dict) else []:
+            # Iterate through each port in the NIC
+            for port in nic.get('Ports', []):
+                # Iterate through each partition in the port
+                for partition in port.get('Partitions', []):
+                        # Create a row for the CSV
+                        result['InventoryDetailsNic'].append({
+                                'OmeId': item['OmeId'],
+                                'DeviceId': item['DeviceId'],
+                                'SourceLoadTimeEpoch': item['SourceLoadTimeEpoch'],
+                                'SerialNumber': item['SerialNumber'],
+                                'NicId': nic.get('NicId', ''),
+                                'VendorName': nic.get('VendorName', '').strip(),
+                                'PortsId': port.get('PortsId', ''),
+                                'InitiatorIpAdress': port.get('InitiatorIpAdress', ''),
+                                'InitiatorSubMask': port.get('InitiatorSubMask', ''),
+                                'LinkStatus': port.get('LinkStatus', ''),
+                                'LinkSpeed': port.get('LinkSpeed', ''),
+                                'Fqdn': partition.get('Fqdn', ''),
+                                'CurrentMacAdress': partition.get('CurrentMacAdress', ''),
+                                'VirtualMacAdress': partition.get('VirtualMacAdress', ''),
+                                'NicMode': partition.get('NicMode', ''),
+                                'MinBandwidth': partition.get('MinBandwidth', ''),
+                                'MaxBandwidth': partition.get('MaxBandwidth', '')
+                            })
+
+
             
     except Exception as e:
         logger.error(f"Blad przetwarzania rekordu: {e} | Item: {item}")
