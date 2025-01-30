@@ -133,48 +133,53 @@ def save_to_csv(data, filename, columns):
 # Główna funkcja
 def main():
     try:
-        # Pobranie tokenu sesji
+        # Load column configurations
+        columns_config = load_config()
+        
+        # Get session token
         session_token = get_session_token()
         
-        # Pobranie listy urządzeń
+        # Get device list
         inventory_base = get_devices(session_token, CHUNK_SIZE)
         
-        # Zapis tabeli inventory_base do CSV
-        save_to_csv(inventory_base, "inventory_base.csv", ["Id", "DeviceName", "Model", "DeviceServiceTag", "Status", "PowerState", "LastInventoryTime", "OmeId", "SourceLoadTimepoch"])
+        # Save inventory_base to CSV
+        save_to_csv(inventory_base, "inventory_base.csv", columns_config['Inventory_base'])
         
-        # Pobranie szczegółów urządzeń równolegle
+        # Get device details in parallel
         with ThreadPoolExecutor(max_workers=BATCH_SIZE) as executor:
             futures = []
             for device in inventory_base:
                 for endpoint in ENDPOINTS:
-                    futures.append(executor.submit(get_device_details_with_retry, session_token, device["Id"], endpoint))
+                    futures.append((endpoint, executor.submit(get_device_details_with_retry, 
+                                                           session_token, 
+                                                           device["Id"], 
+                                                           endpoint)))
             
-            # Przetwarzanie wyników
-            for future in as_completed(futures):
+            # Process results
+            endpoint_data = {}
+            for endpoint, future in futures:
                 result = future.result()
                 if result:
-                    # Przykład dla endpointa /InventoryDetails('serverProcessors')
-                    if "serverProcessors" in result.get("@odata.context", ""):
-                        processors = result.get("value", [])
-                        processor_data = []
-                        for processor in processors:
-                            processor_data.append({
-                                "Id": device["Id"],
-                                "OmeId": device.get("OmeId", ""),
-                                "SourceLoadTimepoch": device.get("SourceLoadTimepoch", ""),
-                                "DeviceServiceTag": device.get("DeviceServiceTag", ""),
-                                "BrandName": processor.get("BrandName", ""),
-                                "ModelName": processor.get("ModelName", ""),
-                                "MaxSpeed": processor.get("MaxSpeed", ""),
-                                "NumberOfCores": processor.get("NumberOfCores", ""),
-                                "Status": processor.get("Status", "")
-                            })
-                        save_to_csv(processor_data, "server_processors.csv", ["Id", "OmeId", "SourceLoadTimepoch", "DeviceServiceTag", "BrandName", "ModelName", "MaxSpeed", "NumberOfCores", "Status"])
+                    category = None
+                    for cat in ['serverProcessors', 'serverNetworkInterfaces', 'SystemUptime', 'Power', 'Temperature']:
+                        if cat in endpoint:
+                            category = cat
+                            break
                     
-                    # Dodaj obsługę innych endpointów tutaj...
-    
+                    if category:
+                        parsed_data = parse_endpoint_data(result, endpoint, device, columns_config)
+                        if parsed_data:
+                            if category not in endpoint_data:
+                                endpoint_data[category] = []
+                            endpoint_data[category].extend(parsed_data)
+            
+            # Save parsed data to CSV files
+            for category, data in endpoint_data.items():
+                if data and category in columns_config:
+                    save_to_csv(data, f"{category}.csv", columns_config[category])
+
     except Exception as e:
-        logger.critical(f"Krytyczny błąd: {e}", exc_info=True)
+        logger.critical(f"Critical error: {e}", exc_info=True)
 
 if __name__ == "__main__":
     main()
