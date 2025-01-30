@@ -38,6 +38,7 @@ def parse_endpoint_data(result: Dict[str, Any], endpoint: str, device_info: Dict
         "DeviceServiceTag": str(device_info.get("DeviceServiceTag", ""))
     }
 
+    
     if category == 'serverNetworkInterfaces':
         if 'InventoryInfo' in result:
             for nic in result['InventoryInfo']:
@@ -63,7 +64,18 @@ def parse_endpoint_data(result: Dict[str, Any], endpoint: str, device_info: Dict
                             'MaxBandwidth': str(partition.get('MaxBandwidth', ''))
                         }
                         parsed_data.append(nic_data)
-
+    elif category == 'Temperature':
+        temp_data = {
+            **base_info,
+            'peakTemperatureUnit': str(result.get('peakTemperatureUnit', '')),
+            'avgTemperatureUnit': str(result.get('avgTemperatureUnit', '')),
+            'instantaneousTemperatureUnit': str(result.get('instantaneousTemperatureUnit', '')),
+            'avgTemperatureTimeStamp': str(result.get('avgTemperatureTimeStamp', '')),
+            'instantaneousTemperature': str(result.get('instantaneousTemperature', '')),
+            'DateFormat': str(result.get('DateFormat', ''))
+        }
+        parsed_data.append(temp_data)
+        
     elif category == 'serverProcessors':
         for processor in result.get('value', []):
             proc_data = {
