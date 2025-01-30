@@ -25,6 +25,8 @@ def parse_endpoint_data(result: Dict[str, Any], endpoint: str, device_info: Dict
         category = 'Power'
     elif 'Temperature' in endpoint:
         category = 'Temperature'
+    elif 'serverMemoryDevices' in endpoint:
+        category = 'serverMemoryDevices'
     
     if not category or category not in columns_config:
         logger.warning(f"Unknown or unconfigured category: {category}")
@@ -75,7 +77,29 @@ def parse_endpoint_data(result: Dict[str, Any], endpoint: str, device_info: Dict
             'DateFormat': str(result.get('DateFormat', ''))
         }
         parsed_data.append(temp_data)
-        
+    elif category == 'serverMemoryDevices':
+        if 'InventoryInfo' in result:
+            for memory in result['InventoryInfo']:
+                memory_data = {
+                    **base_info,
+                    'MemoryId': str(memory.get('Id', '')),
+                    'Name': str(memory.get('Name', '')),
+                    'BankName': str(memory.get('BankName', '')),
+                    'Size': str(memory.get('Size', '')),
+                    'Status': str(memory.get('Status', '')),
+                    'Manufacturer': str(memory.get('Manufacturer', '')),
+                    'PartNumber': str(memory.get('PartNumber', '')),
+                    'SerialNumber': str(memory.get('SerialNumber', '')),
+                    'TypeDetails': str(memory.get('TypeDetails', '')),
+                    'ManufacturerDate': str(memory.get('ManufacturerDate', '')),
+                    'Speed': str(memory.get('Speed', '')),
+                    'CurrentOperatingSpeed': str(memory.get('CurrentOperatingSpeed', '')),
+                    'Rank': str(memory.get('Rank', '')),
+                    'InstanceId': str(memory.get('InstanceId', '')),
+                    'DeviceDescription': str(memory.get('DeviceDescription', ''))
+                }
+        parsed_data.append(memory_data)
+                
     elif category == 'serverProcessors':
         for processor in result.get('value', []):
             proc_data = {
