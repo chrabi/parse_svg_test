@@ -1,0 +1,180 @@
+import requests
+import pandas as pd
+import argparse
+import os
+import time
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+# Konfiguracja logowania
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('ome_api.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Argumenty skryptu
+parser = argparse.ArgumentParser(description="Pobieranie danych z DELL OME REST-API.")
+parser.add_argument('--base_url', required=True, help='Adres URL REST API')
+parser.add_argument('--username', required=True, help='Nazwa użytkownika')
+parser.add_argument('--password', required=True, help='Hasło')
+parser.add_argument('--batch_size', type=int, default=30, help='Liczba równoległych zapytań')
+parser.add_argument('--chunk_size', type=int, default=300, help='Liczba urządzeń pobieranych na raz')
+args = parser.parse_args()
+
+# Stałe
+BASE_URL = args.base_url
+USERNAME = args.username
+PASSWORD = args.password
+BATCH_SIZE = args.batch_size
+CHUNK_SIZE = args.chunk_size
+SESSION_ENDPOINT = "/api/SessionService/Sessions"
+DEVICES_ENDPOINT = "/api/DeviceService/Devices"
+ENDPOINTS = [
+    "/Power",
+    "/Temperature",
+    "/SystemUptime",
+    "/InventoryDetails('serverProcessors')",
+    "/InventoryDetails('serverNetworkInterfaces')"
+]
+OUTPUT_DIR = "output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Funkcja do konwersji czasu ISO na epoch
+def iso_to_epoch(iso_time):
+    try:
+        return int(datetime.fromisoformat(iso_time).timestamp())
+    except (ValueError, TypeError):
+        return None
+
+# Generowanie OmeId z adresu IP
+def generate_ome_id(base_url):
+    ip = base_url.split("//")[-1].split(":")[0]  # Pobierz IP z base_url
+    return ip.replace(".", "")  # Usuń kropki
+
+# Autentykacja i pobranie tokenu sesji
+def get_session_token():
+    auth_url = f"{BASE_URL}{SESSION_ENDPOINT}"
+    try:
+        response = requests.post(auth_url, json={"UserName": USERNAME, "Password": PASSWORD}, verify=False)
+        response.raise_for_status()
+        return response.headers['X-Auth-Token']
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Błąd podczas autentykacji: {e}")
+        raise
+
+# Pobranie listy urządzeń
+def get_devices(session_token, chunk_size):
+    devices = []
+    next_link = f"{BASE_URL}{DEVICES_ENDPOINT}?$top={chunk_size}"
+    
+    while next_link:
+        try:
+            response = requests.get(next_link, headers={"X-Auth-Token": session_token}, verify=False)
+            response.raise_for_status()
+            data = response.json()
+            devices.extend(data.get('value', []))
+            next_link = data.get('@odata.nextLink', None)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Błąd podczas pobierania urządzeń: {e}")
+            break
+    
+    # Dodatkowe kolumny do inventory_base
+    inventory_base = []
+    for device in devices:
+        inventory_base.append({
+            "Id": device.get("Id", ""),
+            "DeviceName": device.get("DeviceName", ""),
+            "Model": device.get("Model", ""),
+            "DeviceServiceTag": device.get("DeviceServiceTag", ""),
+            "Status": device.get("Status", ""),
+            "PowerState": device.get("PowerState", ""),
+            "LastInventoryTime": iso_to_epoch(device.get("LastInventoryTime", "")),
+            "OmeId": generate_ome_id(BASE_URL),
+            "SourceLoadTimepoch": int(time.time())  # Aktualny czas epoch
+        })
+    
+    return inventory_base
+
+# Pobranie szczegółów urządzenia z retry
+def get_device_details_with_retry(session_token, device_id, endpoint, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            result = get_device_details(session_token, device_id, endpoint)
+            if result:
+                return result
+        except Exception as e:
+            logger.warning(f"Próba {attempt + 1} nie powiodła się dla {endpoint}: {e}")
+            time.sleep(1)  # Czekaj 1 sekundę przed ponowną próbą
+    logger.error(f"Błąd po {max_retries} próbach dla {endpoint}")
+    return None
+
+# Pobranie szczegółów urządzenia
+def get_device_details(session_token, device_id, endpoint):
+    url = f"{BASE_URL}{DEVICES_ENDPOINT}({device_id}){endpoint}"
+    try:
+        response = requests.get(url, headers={"X-Auth-Token": session_token}, verify=False)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Błąd podczas pobierania danych z {url}: {e}")
+        raise
+
+# Zapis danych do CSV
+def save_to_csv(data, filename, columns):
+    df = pd.DataFrame(data)
+    df.to_csv(os.path.join(OUTPUT_DIR, filename), index=False, columns=columns)
+
+# Główna funkcja
+def main():
+    try:
+        # Pobranie tokenu sesji
+        session_token = get_session_token()
+        
+        # Pobranie listy urządzeń
+        inventory_base = get_devices(session_token, CHUNK_SIZE)
+        
+        # Zapis tabeli inventory_base do CSV
+        save_to_csv(inventory_base, "inventory_base.csv", ["Id", "DeviceName", "Model", "DeviceServiceTag", "Status", "PowerState", "LastInventoryTime", "OmeId", "SourceLoadTimepoch"])
+        
+        # Pobranie szczegółów urządzeń równolegle
+        with ThreadPoolExecutor(max_workers=BATCH_SIZE) as executor:
+            futures = []
+            for device in inventory_base:
+                for endpoint in ENDPOINTS:
+                    futures.append(executor.submit(get_device_details_with_retry, session_token, device["Id"], endpoint))
+            
+            # Przetwarzanie wyników
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    # Przykład dla endpointa /InventoryDetails('serverProcessors')
+                    if "serverProcessors" in result.get("@odata.context", ""):
+                        processors = result.get("value", [])
+                        processor_data = []
+                        for processor in processors:
+                            processor_data.append({
+                                "Id": device["Id"],
+                                "OmeId": device.get("OmeId", ""),
+                                "SourceLoadTimepoch": device.get("SourceLoadTimepoch", ""),
+                                "DeviceServiceTag": device.get("DeviceServiceTag", ""),
+                                "BrandName": processor.get("BrandName", ""),
+                                "ModelName": processor.get("ModelName", ""),
+                                "MaxSpeed": processor.get("MaxSpeed", ""),
+                                "NumberOfCores": processor.get("NumberOfCores", ""),
+                                "Status": processor.get("Status", "")
+                            })
+                        save_to_csv(processor_data, "server_processors.csv", ["Id", "OmeId", "SourceLoadTimepoch", "DeviceServiceTag", "BrandName", "ModelName", "MaxSpeed", "NumberOfCores", "Status"])
+                    
+                    # Dodaj obsługę innych endpointów tutaj...
+    
+    except Exception as e:
+        logger.critical(f"Krytyczny błąd: {e}", exc_info=True)
+
+if __name__ == "__main__":
+    main()
