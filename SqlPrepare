@@ -1,0 +1,98 @@
+import pandas as pd
+import os
+from typing import Dict, List
+import logging
+
+# Konfiguracja logowania
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+def get_sql_type(dtype: str, column_name: str) -> str:
+    """
+    Mapuje typy danych pandas na typy SQL
+    """
+    # Kolumny zawierające epoch zawsze jako BIGINT
+    if 'epoch' in column_name.lower() or 'timestamp' in column_name.lower():
+        return 'BIGINT'
+    
+    # Kolumny ID jako BIGINT
+    if column_name.lower() == 'id' or column_name.endswith('Id'):
+        return 'BIGINT'
+    
+    # Mapowanie pozostałych typów
+    sql_type_map = {
+        'object': 'NVARCHAR(255)',
+        'int64': 'BIGINT',
+        'float64': 'FLOAT',
+        'bool': 'BIT',
+        'datetime64[ns]': 'DATETIME',
+        'string': 'NVARCHAR(255)'
+    }
+    
+    return sql_type_map.get(str(dtype), 'NVARCHAR(255)')
+
+def generate_create_table_sql(df: pd.DataFrame, table_name: str, schema: str = 'OME') -> str:
+    """
+    Generuje SQL CREATE TABLE na podstawie DataFrame
+    """
+    # Określenie pierwszej kolumny jako klucz główny
+    primary_key = df.columns[0]
+    
+    columns = []
+    for column in df.columns:
+        sql_type = get_sql_type(df[column].dtype, column)
+        # Dodanie NOT NULL dla klucza głównego
+        if column == primary_key:
+            columns.append(f"    {column} {sql_type} NOT NULL")
+        else:
+            columns.append(f"    {column} {sql_type}")
+    
+    sql = f"""CREATE TABLE [{schema}].[{table_name}] (
+{',\n'.join(columns)},
+    CONSTRAINT [PK_{table_name}] PRIMARY KEY CLUSTERED ([{primary_key}])
+);
+"""
+    return sql
+
+def process_csv_files(input_dir: str, output_dir: str):
+    """
+    Przetwarza wszystkie pliki CSV w katalogu i generuje skrypty SQL
+    """
+    # Utworzenie katalogu na wyniki jeśli nie istnieje
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Lista plików CSV
+    csv_files = [f for f in os.listdir(input_dir) if f.endswith('.csv')]
+    
+    for csv_file in csv_files:
+        try:
+            logger.info(f"Przetwarzanie pliku: {csv_file}")
+            
+            # Wczytanie CSV
+            df = pd.read_csv(os.path.join(input_dir, csv_file))
+            
+            # Nazwa tabeli z nazwy pliku (bez rozszerzenia)
+            table_name = os.path.splitext(csv_file)[0]
+            
+            # Generowanie SQL
+            sql = generate_create_table_sql(df, table_name)
+            
+            # Zapis do pliku
+            output_file = os.path.join(output_dir, f"create_{table_name}.sql")
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(sql)
+            
+            logger.info(f"Utworzono skrypt SQL: {output_file}")
+            
+        except Exception as e:
+            logger.error(f"Błąd podczas przetwarzania {csv_file}: {e}")
+
+if __name__ == "__main__":
+    # Katalogi wejściowe i wyjściowe
+    INPUT_DIR = "output"  # katalog z plikami CSV
+    OUTPUT_DIR = "sql_scripts"  # katalog na skrypty SQL
+    
+    process_csv_files(INPUT_DIR, OUTPUT_DIR)
