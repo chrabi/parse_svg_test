@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+
+import argparse
+import requests
+import pandas as pd
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+import json
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+import logging
+import keyring
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+
+# Konfiguracja logowania
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("oneview_script.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Argumenty
+parser = argparse.ArgumentParser(description='Pobieranie danych z HPE OneView API')
+parser.add_argument('--ip', required=True, help='Adres IP HPE OneView')
+parser.add_argument('--batch_size', type=int, default=200, help='Rozmiar paczki danych')
+parser.add_argument('--config', default='config.json', help='Ścieżka do pliku konfiguracyjnego')
+args = parser.parse_args()
+
+# Stałe
+BASE_URL: str = f"https://{args.ip}/rest"
+OUTPUT_DIR: str = "output/OV"
+AUTH_TOKEN: Optional[str] = None
+SERVICE_NAME: str = "HPE_OneView_Script"  # Nazwa serwisu dla keyring
+USERNAME: str = "oneview_user"  # Stała nazwa użytkownika w keyring
+
+# Wczytanie konfiguracji
+def load_config(config_path: str) -> Dict[str, Any]:
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+            logger.info(f"Wczytano konfigurację z {config_path}")
+            return config
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logger.error(f"Błąd wczytywania konfiguracji: {e}")
+        raise
+
+CONFIG: Dict[str, Any] = load_config(args.config)
+CATEGORIES: Dict[str, List[str]] = CONFIG["columns"]
+
+# Mechanizm retry i timeout dla sesji HTTP
+def create_session() -> requests.Session:
+    session = requests.Session()
+    retries = Retry(
+        total=3,  # Liczba ponownych prób
+        backoff_factor=1,  # Opóźnienie między próbami (1s, 2s, 4s)
+        status_forcelist=[500, 502, 503, 504]  # Kody błędów do retry
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    return session
+
+# Bezpieczne przechowywanie hasła za pomocą keyring
+def set_password(username: str, password: str) -> None:
+    keyring.set_password(SERVICE_NAME, username, password)
+    logger.info(f"Hasło dla {username} zapisane w keyring")
+
+def get_password(username: str) -> Optional[str]:
+    password = keyring.get_password(SERVICE_NAME, username)
+    if password is None:
+        logger.error(f"Nie znaleziono hasła dla {username} w keyring")
+    return password
+
+# Funkcja autentykacji z timeoutem
+def get_auth_token(session: requests.Session) -> Optional[str]:
+    global AUTH_TOKEN
+    headers: Dict[str, str] = {'Content-Type': 'application/json'}
+    password = get_password(USERNAME)
+    if not password:
+        return None
+    
+    payload: Dict[str, str] = {
+        "userName": USERNAME,
+        "password": password
+    }
+    
+    try:
+        response = session.post(
+            f"{BASE_URL}/login-sessions",
+            json=payload,
+            headers=headers,
+            verify=False,
+            timeout=10  # Timeout 10 sekund
+        )
+        response.raise_for_status()
+        AUTH_TOKEN = response.json()['sessionID']
+        logger.info("Pomyślnie uzyskano token autoryzacyjny")
+        return AUTH_TOKEN
+    except requests.RequestException as e:
+        logger.error(f"Błąd autentykacji: {e}")
+        return None
+
+# Funkcja pobierania danych z retry i timeout
+def fetch_inventory_data(session: requests.Session, category: str, offset: int, limit: int) -> Optional[Dict[str, Any]]:
+    headers: Dict[str, str] = {
+        'X-API-Version': '2000',
+        'Auth': AUTH_TOKEN,
+        'Content-Type': 'application/json'
+    }
+    
+    endpoint: str = f"{BASE_URL}/server-hardware?start={offset}&count={limit}"
+    
+    try:
+        response = session.get(endpoint, headers=headers, verify=False, timeout=15)  # Timeout 15 sekund
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        logger.error(f"Błąd pobierania danych dla {category}: {e}")
+        return None
+
+# Przetwarzanie danych dla kategorii
+def process_category_data(category: str, data: Optional[Dict[str, Any]]) -> pd.DataFrame:
+    timestamp: int = int(time.time())
+    df_data: List[Dict[str, Any]] = []
+    
+    if data and 'members' in data:
+        for item in data['members']:
+            base_record: Dict[str, Any] = {
+                'Name': item.get('name', 'N/A'),
+                'SerialNumber': item.get('serialNumber', 'N/A'),
+                'Timestamp': timestamp,
+                'Category': category
+            }
+            
+            if category == "Temperature":
+                record = base_record.copy()
+                record.update({
+                    'TemperatureValue': item.get('status', {}).get('temperature', 'N/A'),
+                    'SensorLocation': 'System Board'
+                })
+                df_data.append(record)
+                
+            elif category == "Power":
+                record = base_record.copy()
+                record.update({
+                    'PowerConsumed': item.get('powerState', 'N/A'),
+                    'PowerCapacity': item.get('powerCapacity', 'N/A')
+                })
+                df_data.append(record)
+                
+            elif category == "Memory":
+                record = base_record.copy()
+                record.update({
+                    'MemorySize': item.get('memoryMb', 'N/A'),
+                    'MemoryType': 'N/A'
+                })
+                df_data.append(record)
+    
+    return pd.DataFrame(df_data, columns=CATEGORIES[category])
+
+# Główna funkcja przetwarzania kategorii
+def process_category(session: requests.Session, category: str, batch_size: int) -> None:
+    timestamp_str: str = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_path: Path = Path(f"{OUTPUT_DIR}/{category}/{timestamp_str}")
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    initial_data = fetch_inventory_data(session, category, 0, 1)
+    if not initial_data or 'total' not in initial_data:
+        logger.warning(f"Brak danych dla kategorii {category}")
+        return
+    
+    total_records: int = initial_data['total']
+    offsets: range = range(0, total_records, batch_size)
+    
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(fetch_inventory_data, session, category, offset, batch_size)
+            for offset in offsets
+        ]
+        
+        all_dfs: List[pd.DataFrame] = []
+        for future in futures:
+            data = future.result()
+            if data:
+                df = process_category_data(category, data)
+                if not df.empty:
+                    all_dfs.append(df)
+    
+    if all_dfs:
+        final_df = pd.concat(all_dfs, ignore_index=True)
+        output_file = output_path / f"ov_{category.lower()}_{timestamp_str}.csv"
+        final_df.to_csv(output_file, index=False)
+        logger.info(f"Zapisano dane do: {output_file}")
+
+# Główna funkcja
+def main() -> None:
+    requests.packages.urllib3.disable_warnings()
+    session = create_session()
+    
+    if not get_auth_token(session):
+        logger.error("Nie udało się uzyskać tokenu autoryzacyjnego. Kończenie programu.")
+        return
+    
+    for category in CATEGORIES.keys():
+        logger.info(f"Rozpoczęto przetwarzanie kategorii: {category}")
+        process_category(session, category, args.batch_size)
+
+if __name__ == "__main__":
+    # Przykład ustawienia hasła (uruchom raz, potem zakomentuj)
+    # set_password(USERNAME, "twoje_bezpieczne_haslo")
+    main()
