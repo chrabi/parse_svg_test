@@ -1,4 +1,134 @@
-#!/usr/bin/env python3.12
+# Function to check Dell OME connections in parallel
+def check_dell_ome_parallel(ip_addresses: List[str], max_workers: int, logger: logging.Logger) -> Dict[str, Tuple[bool, int]]:
+    """
+    Checks Dell OME connections for multiple IP addresses in parallel.
+    
+    Args:
+        ip_addresses: List of IP addresses to check
+        max_workers: Maximum number of parallel threads
+        logger: Logger object
+        
+    Returns:
+        Dictionary {ip_address: (session_success, device_count, system_type)}
+    """
+    if not ip_addresses:
+        return {}
+        
+    unique_ips = list(set([ip for ip in ip_addresses if ip and ip != "-"]))  # Remove duplicates and empty IPs
+    results = {}
+    
+    if not unique_ips:
+        logger.warning("No valid IP addresses to check for Dell OME")
+        return results
+    
+    logger.info(f"Starting parallel Dell OME check for {len(unique_ips)} unique IPs using {max_workers} threads")
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Start all Dell OME check tasks
+        future_to_ip = {executor.submit(check_dell_ome_connection, ip): ip for ip in unique_ips}
+        
+        # Process results as they complete
+        completed = 0
+        for future in concurrent.futures.as_completed(future_to_ip):
+            ip = future_to_ip[future]
+            session_success, device_count, system_type = future.result()
+            results[ip] = (session_success, device_count, system_type)
+            
+            completed += 1
+            if completed % 5 == 0 or completed == len(unique_ips):
+                logger.info(f"Dell OME check progress: {completed}/{len(unique_ips)} ({round(completed/len(unique_ips)*100)}%)")
+    
+    # Results summary
+    success_count = sum(1 for result in results.values() if result[0])
+    
+    logger.info(f"Dell OME check completed. Successfully connected to {success_count}/{len(unique_ips)} systems")
+    
+    return results# Function to check systems in parallel
+def check_systems_parallel(ip_addresses: List[str], max_workers: int, logger: logging.Logger) -> Dict[str, Tuple[str, int]]:
+    """
+    Checks system types for multiple IP addresses in parallel.
+    
+    Args:
+        ip_addresses: List of IP addresses to check
+        max_workers: Maximum number of parallel threads
+        logger: Logger object
+        
+    Returns:
+        Dictionary {ip_address: (system_type, device_count)}
+    """
+    if not ip_addresses:
+        return {}
+        
+    unique_ips = list(set([ip for ip in ip_addresses if ip and ip != "-"]))  # Remove duplicates and empty IPs
+    results = {}
+    
+    if not unique_ips:
+        logger.warning("No valid IP addresses to check")
+        return results
+    
+    logger.info(f"Starting parallel system check for {len(unique_ips)} unique IPs using {max_workers} threads")
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Start all system check tasks
+        future_to_ip = {executor.submit(check_system_type, ip, logger): ip for ip in unique_ips}
+        
+        # Process results as they complete
+        completed = 0
+        for future in concurrent.futures.as_completed(future_to_ip):
+            ip = future_to_ip[future]
+            system_type, device_count = future.result()
+            results[ip] = (system_type, device_count)
+            
+            completed += 1
+            if completed % 5 == 0 or completed == len(unique_ips):
+                logger.info(f"System check progress: {completed}/{len(unique_ips)} ({round(completed/len(unique_ips)*100)}%)")
+    
+    # Results summary
+    hp_count = sum(1 for system_type, _ in results.values() if system_type == "HP OV")
+    dell_count = sum(1 for system_type, _ in results.values() if system_type == "Dell OME")
+    unknown_count = sum(1 for system_type, _ in results.values() if not system_type)
+    
+    logger.info(f"System check completed. Found: HP OV: {hp_count}, Dell OME: {dell_count}, Unknown: {unknown_count}")
+    
+    return results# Function to check system type and retrieve server count for a given IP
+def check_system_type(ip_address: str, logger: logging.Logger) -> Tuple[str, int]:
+    """
+    Attempts to identify the system type (HP OV or Dell OME) and get server count.
+    
+    Args:
+        ip_address: Server IP address
+        logger: Logger object
+    
+    Returns:
+        Tuple (system_type, server_count)
+    """
+    if not ip_address or ip_address == "-":
+        return ("", None)
+    
+    try:
+        logger.debug(f"Checking system type for IP: {ip_address}")
+        
+        # First try HP OneView
+        ov_session_success, ov_count, ov_type = check_oneview_connection(ip_address)
+        
+        if ov_session_success:
+            logger.info(f"Successfully identified {ip_address} as HP OneView")
+            return (ov_type, ov_count)
+            
+        # If HP OneView failed, try Dell OME
+        dell_session_success, dell_count, dell_type = check_dell_ome_connection(ip_address)
+        
+        if dell_session_success:
+            logger.info(f"Successfully identified {ip_address} as Dell OME")
+            return (dell_type, dell_count)
+            
+        # If both failed, return empty values
+        logger.warning(f"Failed to identify system type for IP: {ip_address}")
+        return ("", None)
+        
+    except Exception as e:
+        logger.error(f"Error checking system type for {ip_address}: {str(e)}")
+        return ("", None)#!/usr/bin/env python3.12
 """
 Script for executing GraphQL queries and saving results to CSV.
 Query concerns servers from applicationXGenericHardwar with filter on applicationId (175442).
@@ -211,65 +341,69 @@ def get_server_ip(server_name: str, logger: logging.Logger) -> str:
         logger.error(f"Error while pinging server {server_name}: {str(e)}")
         return "-"
 
-# Function to check OneView session and retrieve the server count
-def check_oneview_connection(ip_address: str) -> Tuple[bool, int, str]:
+# Function to check Dell OME connection and retrieve device count
+def check_dell_ome_connection(ip_address: str) -> Tuple[bool, int, str]:
     """
-    Attempts to connect to OneView instance and retrieve server count.
+    Attempts to connect to Dell OME instance and retrieve device count.
     
     Args:
-        ip_address: OneView server IP address
+        ip_address: Dell OME server IP address
     
     Returns:
-        Tuple (session_success, server_count, system_type)
+        Tuple (session_success, device_count, system_type)
     """
     if not ip_address or ip_address == "-":
         return (False, None, "")
         
     try:
-        # URL for HP OneView authentication using provided IP
-        oneview_url = f"https://{ip_address}"
-        auth_url = f"{oneview_url}/rest/login-sessions"
-        server_hardware_url = f"{oneview_url}/rest/server-hardware"
+        # URLs for Dell OME API
+        base_url = f"https://{ip_address}/api"
+        session_endpoint = f"{base_url}/SessionService/Sessions"
+        devices_endpoint = f"{base_url}/DeviceService/Devices"
         
         # Authentication data - replace with proper credentials
         auth_data = {
-            "userName": "admin",
-            "password": "password"
+            "UserName": "admin",
+            "Password": "password",
+            "SessionType": "API"
         }
         
         # Headers for the request
         headers = {
-            "Content-Type": "application/json",
-            "X-API-Version": "800"
+            "Content-Type": "application/json"
         }
         
+        # Disable SSL warnings in development (remove in production)
+        requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
+        
         # Execute authentication request
-        auth_response = requests.post(auth_url, headers=headers, json=auth_data, verify=False, timeout=30)
+        auth_response = requests.post(session_endpoint, headers=headers, json=auth_data, verify=False, timeout=30)
         
-        if auth_response.status_code != 200:
-            return (False, None, "Dell OME")  # Assume Dell OME if authentication failed
+        if auth_response.status_code != 201 and auth_response.status_code != 200:  # Dell OME may return 201 for created session
+            return (False, None, "")
             
-        # Get SessionID
-        session_id = auth_response.json().get("sessionID")
+        # Get session token from header
+        session_token = auth_response.headers.get('X-Auth-Token')
         
-        if not session_id:
-            return (False, None, "Dell OME")
+        if not session_token:
+            return (False, None, "")
             
         # Update headers with session token
-        headers["Auth"] = session_id
+        headers["X-Auth-Token"] = session_token
         
-        # Execute request to /rest/server-hardware
-        servers_response = requests.get(server_hardware_url, headers=headers, verify=False, timeout=30)
+        # Execute request to devices endpoint
+        devices_response = requests.get(devices_endpoint, headers=headers, verify=False, timeout=30)
         
-        if servers_response.status_code != 200:
-            return (True, None, "HP OV")  # Got session but failed to get server count
+        if devices_response.status_code != 200:
+            return (True, None, "Dell OME")  # Got session but failed to get device count
             
-        # Get total number of servers
-        total_servers = servers_response.json().get("total")
+        # Get total number of devices from odata.count
+        devices_data = devices_response.json()
+        device_count = devices_data.get("@odata.count")
         
-        return (True, total_servers, "HP OV")
+        return (True, device_count, "Dell OME")
     except Exception:
-        return (False, None, "Dell OME")
+        return (False, None, "")
 
 # Function to check OneView for multiple IPs in parallel
 def check_oneview_connections_parallel(ip_addresses: List[str], max_workers: int, logger: logging.Logger) -> Dict[str, Tuple[bool, int, str]]:
@@ -446,15 +580,70 @@ def process_and_save_to_csv(data: Dict[str, Any], logger: logging.Logger) -> boo
         # Get all IP addresses from records
         all_ips = [server_row.get("IP") for server_row in csv_data if server_row.get("IP") and server_row.get("IP") != "-"]
         
-        # Check OneView for all IPs in parallel
-        max_workers_ov = min(16, len(all_ips))  # Maximum 16 threads, or less if we have fewer IPs
-        oneview_results = check_oneview_connections_parallel(all_ips, max_workers_ov, logger)
+        # First check HP OneView for all IPs in parallel
+        max_workers = min(16, len(all_ips) if all_ips else 1)
         
-        # Update CSV records with OneView information
+        # First try with HP OneView
+        logger.info("Starting HP OneView connections check...")
+        oneview_results = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_ip = {executor.submit(check_oneview_connection, ip): ip for ip in all_ips}
+            
+            completed = 0
+            for future in concurrent.futures.as_completed(future_to_ip):
+                ip = future_to_ip[future]
+                session_success, server_count, system_type = future.result()
+                oneview_results[ip] = (session_success, server_count, system_type)
+                
+                completed += 1
+                if completed % 5 == 0 or completed == len(all_ips):
+                    logger.info(f"HP OneView check progress: {completed}/{len(all_ips)} ({round(completed/len(all_ips)*100)}%)")
+        
+        # Get IPs that are not HP OneView
+        non_hp_ips = [ip for ip in all_ips if ip not in oneview_results or not oneview_results[ip][0]]
+        
+        # Then check Dell OME for remaining IPs
+        logger.info("Starting Dell OME connections check...")
+        dell_results = {}
+        if non_hp_ips:
+            max_workers = min(16, len(non_hp_ips))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_ip = {executor.submit(check_dell_ome_connection, ip): ip for ip in non_hp_ips}
+                
+                completed = 0
+                for future in concurrent.futures.as_completed(future_to_ip):
+                    ip = future_to_ip[future]
+                    session_success, device_count, system_type = future.result()
+                    dell_results[ip] = (session_success, device_count, system_type)
+                    
+                    completed += 1
+                    if completed % 5 == 0 or completed == len(non_hp_ips):
+                        logger.info(f"Dell OME check progress: {completed}/{len(non_hp_ips)} ({round(completed/len(non_hp_ips)*100)}%)")
+        
+        # Combine results
+        combined_results = {}
+        
+        # Add HP OV results
+        for ip, (success, count, system_type) in oneview_results.items():
+            if success:
+                combined_results[ip] = (system_type, count)
+        
+        # Add Dell OME results for IPs not already identified
+        for ip, (success, count, system_type) in dell_results.items():
+            if success and ip not in combined_results:
+                combined_results[ip] = (system_type, count)
+        
+        # Log summary
+        hp_count = sum(1 for system_type, _ in combined_results.values() if system_type == "HP OV")
+        dell_count = sum(1 for system_type, _ in combined_results.values() if system_type == "Dell OME")
+        
+        logger.info(f"System identifications: HP OV: {hp_count}, Dell OME: {dell_count}, Unknown: {len(all_ips) - hp_count - dell_count}")
+        
+        # Update CSV records with system information
         for server_row in csv_data:
             ip = server_row.get("IP")
-            if ip and ip != "-" and ip in oneview_results:
-                session_success, server_count, system_type = oneview_results[ip]
+            if ip and ip != "-" and ip in combined_results:
+                system_type, server_count = combined_results[ip]
                 server_row["ServerCount"] = server_count
                 server_row["SystemType"] = system_type
         
