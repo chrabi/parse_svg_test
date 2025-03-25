@@ -1,6 +1,25 @@
 {
-    "log_level": "INFO",
-    "max_log_size_mb": 20,
-    "log_dir": "../logs",
-    "console_output": true
+    "log_setup": {
+        "log_level": "INFO",
+        "max_log_size_mb": 20,
+        "log_dir": "../logs",
+        "console_output": true
+    },
+    "database": {
+        "host": "localhost",
+        "port": 5432,
+        "username": "user",
+        "password": "password",
+        "database": "mydb"
+    },
+    "api": {
+        "endpoint": "https://api.example.com",
+        "timeout": 30,
+        "retry_count": 3
+    },
+    "application": {
+        "debug_mode": false,
+        "max_threads": 4,
+        "cache_size_mb": 100
+    }
 }
