@@ -1,0 +1,6 @@
+{
+    "log_level": "INFO",
+    "max_log_size_mb": 20,
+    "log_dir": "../logs",
+    "console_output": true
+}
