@@ -7,6 +7,18 @@ Features:
 - Rotates logs based on file size
 - Configurable via config file
 - Optional console output
+from logger_module import setup_logger
+
+# Basic usage
+logger = setup_logger()
+logger.info("This is an info message")
+
+# Advanced usage with overrides
+custom_logger = setup_logger(
+    logger_name="custom_log",
+    log_level="DEBUG",
+    console_output=True
+)
 """
 
 import os
