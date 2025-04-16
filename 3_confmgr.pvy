@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import argparse
+import time
+import csv
+import logging
+import configparser
+import json
+import pandas as pd
+import concurrent.futures
+import requests
+import datetime
+import re
+from requests.exceptions import RequestException
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('hds_get_confmgr.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('HDS_CONFIG_MANAGER')
+
+# Constants
+MAX_RETRIES = 2
+DEFAULT_TIMEOUT = 60  # seconds
+PARALLEL_REQUESTS = 4
+CONFIG_FILE = 'config.cfg'
+OUTPUT_DIR = '/chrabi/HDS/'
+
+
+class HitachiConfigManager:
+    def __init__(self, ip, groups=None):
+        self.ip = ip
+        self.base_url = f"https://{ip}/ConfigurationManager/v1"
+        self.session_token = None
+        self.timeout = DEFAULT_TIMEOUT
+        self.blacklist = []
+        self.groups = groups.split(',') if groups else None
+        self.summary_data = []
+        
+        # Load configuration from config file
+        self.load_config()
+        
+        # Ensure output directories exist
+        self.create_output_dirs()
+        
+    def load_config(self):
+        """Load configuration from config.cfg file"""
+        if not os.path.exists(CONFIG_FILE):
+            logger.warning(f"Config file {CONFIG_FILE} not found. Using default settings.")
+            return
+        
+        try:
+            config = configparser.ConfigParser()
+            config.read(CONFIG_FILE)
+            
+            # Get timeout
+            if 'DEFAULT' in config and 'timeout' in config['DEFAULT']:
+                self.timeout = int(config['DEFAULT']['timeout'])
+            
+            # Get blacklist
+            if 'BLACKLIST' in config:
+                self.blacklist = [item.strip() for item in config['BLACKLIST'].get('arrays', '').split(',') if item.strip()]
+            
+            # Get groups if not provided via command line
+            if not self.groups and 'GROUPS' in config:
+                self.groups = [item.strip() for item in config['GROUPS'].get('names', '').split(',') if item.strip()]
+            
+            # If still no groups, use default
+            if not self.groups:
+                self.groups = ['pools', 'hostgroups', 'ldevs']
+            
+            logger.info(f"Loaded configuration: timeout={self.timeout}, blacklist={self.blacklist}, groups={self.groups}")
+            
+        except Exception as e:
+            logger.error(f"Error loading config file: {e}")
+            sys.exit(1)
+            
+    def create_output_dirs(self):
+        """Create output directories for each group"""
+        try:
+            # Create base output directory
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            
+            # Create subdirectories for each group
+            for group in self.groups:
+                group_dir = os.path.join(OUTPUT_DIR, group)
+                os.makedirs(group_dir, exist_ok=True)
+                logger.info(f"Created directory: {group_dir}")
+                
+        except Exception as e:
+            logger.error(f"Error creating output directories: {e}")
+            sys.exit(1)
+            
+    def get_session_token(self):
+        """Get session token from Hitachi Configuration Manager"""
+        try:
+            url = f"{self.base_url}/objects/sessions"
+            headers = {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+            }
+            payload = {
+                "sessionId": None,
+                "userId": "admin",
+                "password": "admin"  # In a real implementation, this should be from config or secure storage
+            }
+            
+            response = requests.post(url, headers=headers, json=payload, timeout=self.timeout, verify=False)
+            response.raise_for_status()
+            
+            data = response.json()
+            self.session_token = data.get('token')
+            
+            if not self.session_token:
+                logger.error("Failed to get session token: No token in response")
+                sys.exit(1)
+                
+            logger.info("Successfully obtained session token")
+            return self.session_token
+            
+        except Exception as e:
+            logger.error(f"Error getting session token: {e}")
+            sys.exit(1)
+            
+    def get_storage_systems(self):
+        """Get list of storage systems"""
+        try:
+            url = f"{self.base_url}/objects/storages"
+            headers = {
+                'Accept': 'application/json',
+                'Authorization': f'Session {self.session_token}'
+            }
+            
+            response = requests.get(url, headers=headers, timeout=self.timeout, verify=False)
+            response.raise_for_status()
+            
+            data = response.json()
+            storages = data.get('data', [])
+            
+            # Filter out blacklisted storage systems
+            filtered_storages = [
+                storage for storage in storages 
+                if storage.get('name') not in self.blacklist
+            ]
+            
+            logger.info(f"Found {len(filtered_storages)} storage systems (excluded {len(storages) - len(filtered_storages)} blacklisted)")
+            return filtered_storages
+            
+        except Exception as e:
+            logger.error(f"Error getting storage systems: {e}")
+            return []
+            
+    def get_group_data(self, storage_id, group_name):
+        """Get data for a specific group from a storage system with retries"""
+        for retry in range(MAX_RETRIES + 1):
+            try:
+                url = f"{self.base_url}/objects/storages/{storage_id}/{group_name}"
+                headers = {
+                    'Accept': 'application/json',
+                    'Authorization': f'Session {self.session_token}'
+                }
+                
+                response = requests.get(url, headers=headers, timeout=self.timeout, verify=False)
+                response.raise_for_status()
+                
+                data = response.json()
+                return data.get('data', [])
+                
+            except RequestException as e:
+                if retry < MAX_RETRIES:
+                    logger.warning(f"Retry {retry+1}/{MAX_RETRIES} for storage {storage_id}, group {group_name}: {e}")
+                    time.sleep(2)  # Wait before retrying
+                else:
+                    logger.error(f"Failed to get data for storage {storage_id}, group {group_name} after {MAX_RETRIES} retries: {e}")
+                    return []
+                    
+    def process_storage_system(self, storage):
+        """Process a single storage system for all groups"""
+        storage_id = storage.get('id')
+        storage_name = storage.get('name')
+        
+        logger.info(f"Processing storage system: {storage_name} (ID: {storage_id})")
+        
+        for group in self.groups:
+            group_data = self.get_group_data(storage_id, group)
+            record_count = len(group_data)
+            
+            if record_count > 0:
+                # Convert to DataFrame and save as CSV
+                df = pd.DataFrame(group_data)
+                timestamp = int(time.time())
+                filename = f"{storage_name}_{group}_{timestamp}.csv"
+                filepath = os.path.join(OUTPUT_DIR, group, filename)
+                
+                df.to_csv(filepath, index=False)
+                logger.info(f"Saved {record_count} records for {storage_name}, group {group} to {filepath}")
+                
+                # Add to summary
+                summary_entry = {
+                    'ip_confmgr': self.ip,
+                    'storage_name': storage_name,
+                    'group_name': group,
+                    'record_count': record_count,
+                    'timestamp': timestamp
+                }
+                self.summary_data.append(summary_entry)
+            else:
+                logger.warning(f"No data retrieved for {storage_name}, group {group}")
+                
+                # Add empty entry to summary
+                summary_entry = {
+                    'ip_confmgr': self.ip,
+                    'storage_name': storage_name,
+                    'group_name': group,
+                    'record_count': 0,
+                    'timestamp': int(time.time())
+                }
+                self.summary_data.append(summary_entry)
+                
+    def process_all_storage_systems(self):
+        """Process all storage systems in parallel"""
+        # Get session token
+        self.get_session_token()
+        
+        # Get list of storage systems
+        storage_systems = self.get_storage_systems()
+        
+        if not storage_systems:
+            logger.error("No storage systems found or all are blacklisted")
+            return
+            
+        # Process storage systems in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL_REQUESTS) as executor:
+            futures = [executor.submit(self.process_storage_system, storage) for storage in storage_systems]
+            
+            # Wait for all futures to complete
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error in thread: {e}")
+                    
+        # Create summary CSV
+        self.create_summary_csv()
+        
+    def create_summary_csv(self):
+        """Create summary CSV with request results"""
+        if not self.summary_data:
+            logger.warning("No summary data to save")
+            return
+            
+        try:
+            df = pd.DataFrame(self.summary_data)
+            timestamp = int(time.time())
+            filename = f"summary_{self.ip}_{timestamp}.csv"
+            filepath = os.path.join(OUTPUT_DIR, filename)
+            
+            df.to_csv(filepath, index=False)
+            logger.info(f"Saved summary to {filepath}")
+            
+        except Exception as e:
+            logger.error(f"Error creating summary CSV: {e}")
+
+
+def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Hitachi Configuration Manager Data Retrieval Script')
+    parser.add_argument('--ip', required=True, help='IP address of Hitachi Configuration Manager')
+    parser.add_argument('--grp', help='Comma-separated list of groups to retrieve (e.g., pools,hostgroups,ldevs)')
+    
+    args = parser.parse_args()
+    
+    # Disable SSL warnings (in a production environment, proper SSL verification should be implemented)
+    requests.packages.urllib3.disable_warnings()
+    
+    # Create and run the Hitachi Configuration Manager client
+    client = HitachiConfigManager(args.ip, args.grp)
+    client.process_all_storage_systems()
+    
+    logger.info("Script execution completed")
+
+
+if __name__ == "__main__":
+    main()
