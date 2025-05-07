@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import subprocess
+import re
+import os
+import sys
+import csv
+import pandas as pd
+import configparser
+from datetime import datetime
+
+def run_command(command):
+    """Execute shell command and return output"""
+    try:
+        result = subprocess.run(command, shell=True, check=True, 
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               universal_newlines=True)
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        print(f"Error executing command: {command}")
+        print(f"Error message: {e.stderr}")
+        sys.exit(1)
+
+def load_config(config_file='config.ini'):
+    """Load configuration from file"""
+    if not os.path.exists(config_file):
+        print(f"Configuration file {config_file} not found")
+        sys.exit(1)
+    
+    config = configparser.ConfigParser()
+    config.read(config_file)
+    return config
+
+def main():
+    # Load configuration
+    config = load_config()
+    
+    # Extract credentials
+    username = config['credentials']['username']
+    password = config['credentials']['password']
+    instance = config.get('system', 'instance', fallback='99')
+    
+    # Login to instance 99
+    print(f"Logowanie do instancji {instance}...")
+    login_cmd = f"raidcom -login {username} {password} -I{instance}"
+    run_command(login_cmd)
+    
+    # Get storage array serial number
+    print("Pobieranie numeru seryjnego macierzy...")
+    raidql_cmd = f"raidql -I{instance}"
+    raidql_output = run_command(raidql_cmd)
+    
+    # Extract Serial# from output
+    serial_match = re.search(r'Serial#\s*:\s*(\d+)', raidql_output)
+    if not serial_match:
+        print("Nie udało się pobrać numeru seryjnego macierzy.")
+        sys.exit(1)
+    
+    serial_number = serial_match.group(1)
+    print(f"Numer seryjny macierzy: {serial_number}")
+    
+    # Get port information
+    print("Pobieranie informacji o portach...")
+    port_cmd = f"raidcom get port -I{instance}"
+    port_output = run_command(port_cmd)
+    
+    # Parse port output to get port IDs
+    port_ids = re.findall(r'CL\d+-[A-Z]', port_output)
+    
+    # Initialize data collection
+    all_spm_data = []
+    
+    # For each port, check host groups and WWPNs
+    for port_id in port_ids:
+        print(f"Sprawdzanie hosta grup dla portu {port_id}...")
+        host_cmd = f"raidcom get host_grp -port {port_id} -I{instance}"
+        host_output = run_command(host_cmd)
+        
+        # Get WWPNs for each host group
+        host_groups = re.findall(r'(CL\d+-[A-Z]-\d+)', host_output)
+        
+        for host_group in host_groups:
+            print(f"Pobieranie WWPN dla grupy {host_group}...")
+            wwpn_cmd = f"raidcom get hba_wwn -port {host_group} -I{instance}"
+            wwpn_output = run_command(wwpn_cmd)
+            
+            # Extract WWPNs
+            wwpns = re.findall(r'([0-9A-Fa-f]{16})', wwpn_output)
+            
+            for wwpn in wwpns:
+                # Format WWPN with colons for readability
+                formatted_wwpn = ':'.join([wwpn[i:i+2] for i in range(0, len(wwpn), 2)])
+                
+                # Get SPM (I/O limits) data for each WWPN
+                print(f"Pobieranie danych SPM dla WWPN {formatted_wwpn}...")
+                spm_cmd = f"raidcom get spm_wwn -port {port_id} -wwn {wwpn} -I{instance}"
+                spm_output = run_command(spm_cmd)
+                
+                # Parse SPM output
+                # Assuming SPM output has columns like PORT WWPN IOps/s KB/s
+                spm_lines = spm_output.strip().split('\n')
+                if len(spm_lines) > 1:  # Header + data
+                    for line in spm_lines[1:]:
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            spm_data = {
+                                'PORT': parts[0],
+                                'WWPN': formatted_wwpn,
+                                'IOps': parts[2],
+                                'KB/s': parts[3],
+                                'Host_Group': host_group
+                            }
+                            all_spm_data.append(spm_data)
+    
+    # Create DataFrame and save to CSV
+    if all_spm_data:
+        df = pd.DataFrame(all_spm_data)
+        
+        # Generate timestamp for filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_filename = f"spm_report_{serial_number}_{timestamp}.csv"
+        
+        df.to_csv(csv_filename, index=False)
+        print(f"Raport SPM zapisany do pliku: {csv_filename}")
+    else:
+        print("Nie znaleziono danych SPM.")
+    
+    # Logout from instance
+    print(f"Wylogowywanie z instancji {instance}...")
+    logout_cmd = f"raidcom -logout -I{instance}"
+    run_command(logout_cmd)
+
+if __name__ == "__main__":
+    main()
