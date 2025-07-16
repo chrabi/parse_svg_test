@@ -366,6 +366,42 @@ def process_serial_chunk(serial_chunk, args, TIME_EPOCH, TIME_DAYS, TIME_5MIN):
     
     LOG.info(f"[{chunk_name}] Completed processing chunk: {serial_chunk}")
 
+def parse_csv_content(content, separator=","):
+    """Parse CSV-like content into list of dictionaries"""
+    lines = content.strip().split('\n')
+    if not lines:
+        return []
+    
+    # Get headers from first line
+    headers = [h.strip() for h in lines[0].split(separator)]
+    
+    data = []
+    for line in lines[1:]:
+        if line.strip():
+            values = [v.strip() for v in line.split(separator)]
+            if len(values) >= len(headers):
+                row_dict = {}
+                for i, header in enumerate(headers):
+                    row_dict[header] = values[i] if i < len(values) else ""
+                data.append(row_dict)
+    
+    return data
+
+def show_directory_structure():
+    """Show the generated directory structure for user confirmation"""
+    if os.path.exists("reports"):
+        LOG.info("📂 Generated directory structure:")
+        for root, dirs, files in os.walk("reports"):
+            level = root.replace("reports", "").count(os.sep)
+            indent = "  " * level
+            LOG.info(f"{indent}📁 {os.path.basename(root)}/")
+            subindent = "  " * (level + 1)
+            for file in files:
+                file_size = os.path.getsize(os.path.join(root, file))
+                LOG.info(f"{subindent}📄 {file} ({file_size} bytes)")
+    else:
+        LOG.warning("📂 No reports directory found")
+
 def calculate_percentage(monitor_kbps, spml_limit_kbps):
     """Calculate percentage with 2 decimal places"""
     try:
@@ -490,6 +526,10 @@ def main():
             LOG.info(f"✅ Completed chunk {i+1}/{len(serial_chunks)}")
 
         LOG.info("🎉 All serial numbers processed successfully!")
+        
+        # Show generated directory structure
+        show_directory_structure()
+        
         LOG.info("📁 Check 'reports' directory for generated files")
         LOG.info(f"🌐 Files also sent to {scp_config['scp_server']}:{scp_config['scp_path']}")
 
