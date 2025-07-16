@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Raidcom IOLimit data collection script
-Compatible with Python 3.6.8 but now uses pandas for data processing
-Includes multithreading and individual file processing per serial number
+Raidcom IOLimit data collection script - Version 36
+Compatible with Python 3.6.8 with pandas for data processing
+Includes multithreading and immediate SCP transfer per file
 """
 
 import subprocess
@@ -20,10 +20,16 @@ import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
+import io
+from typing import List, Dict, Tuple
 
 # Setup logging with thread safety
 LOG = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s')
+
+# Global data structures with thread safety
+all_spm_data = []
+data_lock = threading.Lock()
 
 def load_config_file(config_file):
     """Load configuration from file"""
@@ -43,10 +49,7 @@ def get_timestamp(format_type="epoch"):
         return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 def get_file_path(array_serial):
-    """Get the file path for array serial
-    input: array_serial - serial number of the storage array
-    Returns: path to the directory for reports/timestamp/array_serial
-    """
+    """Get the file path for array serial"""
     report_dir = "reports"
     DIR_TIME_5MIN = get_timestamp("5min")
     out_dir = os.path.join(report_dir, DIR_TIME_5MIN)
@@ -59,12 +62,11 @@ def get_file_path(array_serial):
     if not os.path.exists(array_dir):
         os.makedirs(array_dir, exist_ok=True)
     
-    return os.path.join(array_dir)
+    return array_dir
 
 def simple_encrypt(text, key="default_key"):
-    """Simple base64 encoding (replacement for Fernet)"""
+    """Simple base64 encoding"""
     try:
-        # Combine text with key for basic obfuscation
         combined = f"{key}:{text}"
         encoded = base64.b64encode(combined.encode()).decode()
         return encoded
@@ -85,7 +87,6 @@ def simple_decrypt(encoded_text, key="default_key"):
 
 def get_credentials(user_salt, password_salt, api_name):
     """Get credentials with simple decoding"""
-    # This is a simplified version - in production you'd want proper credential management
     username = simple_decrypt(user_salt)
     password = simple_decrypt(password_salt) 
     return username, password
@@ -104,19 +105,17 @@ def run_command(command):
         return result.stdout
     except subprocess.CalledProcessError as e:
         LOG.error(f"Error executing command: {command}")
-        LOG.info(f"Error message: {e.stderr}")
-        sys.exit(1)
+        LOG.error(f"Error message: {e.stderr}")
+        return None
 
 def send_scp_file(user, file_path, remote_server, remote_path, scp_key):
-    """Send file to remote server using SCP"""
+    """Send file to remote server using SCP - Thread-safe version"""
     try:
-        # Prepare catalog on remote server
-        remote_mkdir_command = (
-            f"ssh -i {scp_key} {user}@{remote_server} mkdir -p {remote_path}"
-        )
-        LOG.info(f"Creating remote directory: {remote_path} on {remote_server} with command: {remote_mkdir_command}")
+        # Thread-safe remote directory creation
+        remote_mkdir_command = f"ssh -i {scp_key} {user}@{remote_server} mkdir -p {remote_path}"
+        LOG.info(f"[{threading.current_thread().name}] Creating remote directory: {remote_path}")
         
-        remote_create_catalog = subprocess.run(
+        result = subprocess.run(
             remote_mkdir_command,
             shell=True,
             check=True,
@@ -124,15 +123,10 @@ def send_scp_file(user, file_path, remote_server, remote_path, scp_key):
             stderr=subprocess.PIPE,
             universal_newlines=True,
         )
-        
-        if remote_create_catalog.returncode != 0:
-            raise subprocess.CalledProcessError(
-                remote_create_catalog.returncode, remote_mkdir_command
-            )
 
         # SCP command
         scp_command = f"scp -i {scp_key} {file_path} {user}@{remote_server}:{remote_path}"
-        LOG.info(f"SCP send: {file_path} on {remote_server} to path {remote_path} with command: {scp_command}")
+        LOG.info(f"[{threading.current_thread().name}] Sending file: {file_path} to {remote_server}:{remote_path}")
         
         result = subprocess.run(
             scp_command,
@@ -143,36 +137,20 @@ def send_scp_file(user, file_path, remote_server, remote_path, scp_key):
             universal_newlines=True,
         )
         
-        if result.returncode != 0:
-            raise subprocess.CalledProcessError(result.returncode, scp_command)
-        
-        # Check if file was sent successfully
-        if not os.path.exists(file_path):
-            LOG.error(f"File {file_path} does not exist after sending.")
-        else:
-            # Check if the file exists on the remote server
-            remote_check_result = subprocess.run(
-                f"ssh -i {scp_key} {user}@{remote_server} ls {remote_path}",
-                shell=True,
-                capture_output=True,
-                text=True,
-            )
-            if remote_check_result.returncode == 0:
-                LOG.info(f"File {file_path} exists on the remote server {remote_server}")
-            
-        LOG.info(f"File {file_path} sent to {remote_server}:{remote_path}")
+        LOG.info(f"[{threading.current_thread().name}] ✅ File {file_path} sent successfully")
+        return True
         
     except subprocess.CalledProcessError as e:
-        LOG.error(f"Error sending file {file_path}: {e.stderr}")
-        sys.exit(1)
+        LOG.error(f"[{threading.current_thread().name}] ❌ Error sending file {file_path}: {e.stderr}")
+        return False
 
 def save_meta_json(filename, batch_epoch, column, region):
-    """Save data to CSV file metadata"""
+    """Save metadata to JSON file"""
     data = {
         "db_name": f"SAN_INFO_{region.upper()}",
         "table_schema": "Hitachi",
         "table_name": column,
-        "sql_timestamp": "2025-05-11T05:15:03",
+        "sql_timestamp": datetime.datetime.now().isoformat(),
         "index_key": "ArraySerial,ArrayPort,HostNickname",
         "staging_db": "STAGING",
         "batch_epoch_identifier": batch_epoch,
@@ -181,30 +159,24 @@ def save_meta_json(filename, batch_epoch, column, region):
         "delimiter": ",",
     }
     
-    # Save as JSON
     with open(filename, "w") as f:
         json.dump(data, f, indent=4)
 
-def parse_csv_content(content, separator=","):
-    """Parse CSV-like content into list of dictionaries"""
-    lines = content.strip().split('\n')
-    if not lines:
-        return []
+def parse_raidcom_output_with_pandas(content: str, separator: str = " ") -> pd.DataFrame:
+    """Parse raidcom output using pandas"""
+    if not content or not content.strip():
+        return pd.DataFrame()
     
-    # Get headers from first line
-    headers = [h.strip() for h in lines[0].split(separator)]
+    # Use io.StringIO to create file-like object from string
+    string_buffer = io.StringIO(content)
     
-    data = []
-    for line in lines[1:]:
-        if line.strip():
-            values = [v.strip() for v in line.split(separator)]
-            if len(values) >= len(headers):
-                row_dict = {}
-                for i, header in enumerate(headers):
-                    row_dict[header] = values[i] if i < len(values) else ""
-                data.append(row_dict)
-    
-    return data
+    try:
+        # Read with pandas, handling various separators
+        df = pd.read_csv(string_buffer, sep=r'\s+', engine='python')
+        return df
+    except Exception as e:
+        LOG.error(f"Error parsing with pandas: {e}")
+        return pd.DataFrame()
 
 def get_serial_numbers(instance):
     """Get all serial numbers from raidqry -l command"""
@@ -213,9 +185,11 @@ def get_serial_numbers(instance):
         LOG.info(f"Getting serial numbers with command: {cmd}")
         
         output = run_command(cmd)
+        if not output:
+            return []
         
-        # Extract serial numbers (assuming 5-digit numbers starting with 5)
-        serial_numbers = re.findall(r'\b5\d{4}\b', output)
+        # Extract serial numbers (5-digit numbers)
+        serial_numbers = re.findall(r'\b\d{5}\b', output)
         
         if not serial_numbers:
             LOG.warning("No serial numbers found from raidqry command")
@@ -241,167 +215,6 @@ def chunk_list(lst, chunk_size):
     for i in range(0, len(lst), chunk_size):
         yield lst[i:i + chunk_size]
 
-def process_serial_number(serial_number, args, TIME_EPOCH, TIME_DAYS, TIME_5MIN):
-    """Process a single serial number to collect SPM data"""
-    thread_name = threading.current_thread().name
-    LOG.info(f"[{thread_name}] Processing serial number: {serial_number}")
-    
-    try:
-        local_spm_data = []
-        
-        # Get port information for this serial number
-        port_cmd = f"raidcom get port -s {serial_number} -IH{{{args.inst}}} |grep {args.inst}"
-        LOG.info(f"[{thread_name}] Getting ports for serial {serial_number}")
-        
-        port_output = run_command(port_cmd)
-        
-        # Parse port output to get port IDs
-        port_ids = re.findall(r'CL\d-[A-Z]-[A-Z]', port_output)
-        LOG.info(f"[{thread_name}] Found {len(port_ids)} ports for serial {serial_number}: {port_ids}")
-        
-        # For each port, check host groups and WWPNs
-        for port_id in port_ids:
-            LOG.info(f"[{thread_name}] Check spm_wwn in array {serial_number} for port {port_id}...")
-            
-            # Get SPM WWN information for this port
-            host_cmd = f"raidcom get spm_wwn -port {port_id} -s {serial_number} -IH{{{args.inst}}} -T{args.inst}"
-            host_output = run_command(host_cmd)
-            
-            if not host_output:
-                LOG.warning(f"[{thread_name}] No data found for port {port_id} on serial {serial_number}")
-                continue
-            else:
-                LOG.info(f"[{thread_name}] Data found in host_output for port {port_id}, {len(host_output)} lines")
-                
-                # Parse host data as CSV
-                host_data = parse_csv_content(host_output, separator=" ")
-                
-                if not host_data:
-                    LOG.info(f"[{thread_name}] No parseable data found in host_output for port {port_id}")
-                    continue
-                
-                # Extract WWPNs
-                wwpns_pattern = r"([0-9a-fa-f]{16})"
-                wwpns = re.findall(wwpns_pattern, host_output)
-                LOG.info(f"[{thread_name}] Found wwpns: {wwpns}")
-                
-                for host_wwpn in wwpns:
-                    # Get SPM monitoring data for each WWPN
-                    spm_cmd = f"raidcom get spm_wwn -port {port_id} -hba_wwn {host_wwpn} -s {serial_number} -IH{{{args.inst}}} -T{args.inst}"
-                    spm_output = run_command(spm_cmd)
-                    
-                    # Parse SPM output
-                    spm_data = parse_csv_content(spm_output, separator=" ")
-                    
-                    if spm_data:
-                        # Extract required fields and add to collection
-                        for row in spm_data:
-                            # Extract values from the parsed data
-                            spm_value = row.get('KBps', '')
-                            spm_priority = row.get('Pri', '')
-                            
-                            # Find host nickname from the data
-                            host_nickname = ""
-                            nickname_match = re.search(r'10009440c9d0b045', host_output)
-                            if nickname_match:
-                                host_group = re.findall(r'host_pattern, host_nickname\.values\[0\]', host_output)
-                                if host_group:
-                                    host_nickname = host_group[0]
-                            
-                            # Format WWPN with colons for readability
-                            formatted_wwpn = ":".join([
-                                host_wwpn[i : i + 2] for i in range(0, len(host_wwpn), 2)
-                            ])
-                            
-                            # Parse SPM output to extract monitoring data
-                            spm_lines = spm_output.strip().split('\n')
-                            if len(spm_lines) > 1:  # Header + data
-                                for line in spm_lines[1:]:
-                                    parts = line.split()
-                                    if len(parts) >= 4:
-                                        spm_data_entry = {
-                                            "ArraySerial": serial_number,
-                                            "ArrayPort": port_id,
-                                            "HostNickname": host_nickname if host_nickname else "Unknown",
-                                            "HostGroup": host_group[0] if 'host_group' in locals() else "",
-                                            "HostWWPN": formatted_wwpn,
-                                            "MonitorIOps": int(parts[2]) if parts[2].isdigit() else 0,
-                                            "MonitorKBps": int(parts[3]) if parts[3].isdigit() else 0,
-                                            "SPMLimitKBps": int(spm_value) if spm_value and spm_value.isdigit() else 0,
-                                            "SPMPriority": spm_priority if spm_priority else "",
-                                            "SourceLoadTimeEpoch": TIME_EPOCH,
-                                            "SourceName": "HostIOLimit",
-                                            "BatchCreateTimeEpoch": TIME_EPOCH,
-                                        }
-                                        local_spm_data.append(spm_data_entry)
-        
-        # Thread-safe adding to global data
-        with data_lock:
-            all_spm_data.extend(local_spm_data)
-        
-        LOG.info(f"[{thread_name}] Completed processing serial {serial_number}, collected {len(local_spm_data)} records")
-        
-    except Exception as e:
-        LOG.error(f"[{thread_name}] Error processing serial number {serial_number}: {e}")
-
-def process_serial_chunk(serial_chunk, args, TIME_EPOCH, TIME_DAYS, TIME_5MIN):
-    """Process a chunk of serial numbers in parallel"""
-    chunk_name = f"Chunk-{'-'.join(serial_chunk)}"
-    LOG.info(f"[{chunk_name}] Starting processing chunk: {serial_chunk}")
-    
-    # Create threads for each serial number in the chunk
-    threads = []
-    for serial_number in serial_chunk:
-        thread = threading.Thread(
-            target=process_serial_number,
-            args=(serial_number, args, TIME_EPOCH, TIME_DAYS, TIME_5MIN),
-            name=f"Serial-{serial_number}"
-        )
-        threads.append(thread)
-        thread.start()
-    
-    # Wait for all threads in this chunk to complete
-    for thread in threads:
-        thread.join()
-    
-    LOG.info(f"[{chunk_name}] Completed processing chunk: {serial_chunk}")
-
-def parse_csv_content(content, separator=","):
-    """Parse CSV-like content into list of dictionaries"""
-    lines = content.strip().split('\n')
-    if not lines:
-        return []
-    
-    # Get headers from first line
-    headers = [h.strip() for h in lines[0].split(separator)]
-    
-    data = []
-    for line in lines[1:]:
-        if line.strip():
-            values = [v.strip() for v in line.split(separator)]
-            if len(values) >= len(headers):
-                row_dict = {}
-                for i, header in enumerate(headers):
-                    row_dict[header] = values[i] if i < len(values) else ""
-                data.append(row_dict)
-    
-    return data
-
-def show_directory_structure():
-    """Show the generated directory structure for user confirmation"""
-    if os.path.exists("reports"):
-        LOG.info("📂 Generated directory structure:")
-        for root, dirs, files in os.walk("reports"):
-            level = root.replace("reports", "").count(os.sep)
-            indent = "  " * level
-            LOG.info(f"{indent}📁 {os.path.basename(root)}/")
-            subindent = "  " * (level + 1)
-            for file in files:
-                file_size = os.path.getsize(os.path.join(root, file))
-                LOG.info(f"{subindent}📄 {file} ({file_size} bytes)")
-    else:
-        LOG.warning("📂 No reports directory found")
-
 def calculate_percentage(monitor_kbps, spml_limit_kbps):
     """Calculate percentage with 2 decimal places"""
     try:
@@ -412,55 +225,245 @@ def calculate_percentage(monitor_kbps, spml_limit_kbps):
     except (ValueError, ZeroDivisionError):
         return 0
 
+def process_and_save_serial_data(serial_number: str, data_list: List[Dict], 
+                               TIME_EPOCH: str, region: str, scp_config: Dict):
+    """Process data for a single serial and save to CSV/JSON with immediate SCP transfer"""
+    if not data_list:
+        LOG.warning(f"No data to save for serial {serial_number}")
+        return
+    
+    try:
+        # Convert to pandas DataFrame
+        df = pd.DataFrame(data_list)
+        
+        # Add calculated percentage column
+        if 'MonitorKBps' in df.columns and 'SPMLimitKBps' in df.columns:
+            df['PercentageUsed'] = df.apply(
+                lambda row: calculate_percentage(row['MonitorKBps'], row['SPMLimitKBps']), 
+                axis=1
+            )
+        
+        # Sort by ArrayPort and HostNickname
+        if 'ArrayPort' in df.columns and 'HostNickname' in df.columns:
+            df = df.sort_values(['ArrayPort', 'HostNickname'])
+        
+        # Get file paths
+        array_dir = get_file_path(serial_number)
+        csv_filename = f"HostIOLimit_{serial_number}_{TIME_EPOCH}.csv"
+        json_filename = f"HostIOLimit_{serial_number}_{TIME_EPOCH}.json"
+        
+        csv_path = os.path.join(array_dir, csv_filename)
+        json_path = os.path.join(array_dir, json_filename)
+        
+        # Save CSV using pandas
+        df.to_csv(csv_path, index=False)
+        LOG.info(f"[{threading.current_thread().name}] 💾 Saved CSV: {csv_path}")
+        
+        # Save metadata JSON
+        save_meta_json(json_path, TIME_EPOCH, "HostIOLimit", region)
+        LOG.info(f"[{threading.current_thread().name}] 💾 Saved JSON: {json_path}")
+        
+        # Send files via SCP immediately
+        if scp_config:
+            remote_array_dir = os.path.join(scp_config['scp_path'], get_timestamp("5min"), serial_number)
+            
+            # Send CSV
+            send_scp_file(
+                scp_config['scp_user'], 
+                csv_path, 
+                scp_config['scp_server'], 
+                remote_array_dir, 
+                scp_config['scp_key']
+            )
+            
+            # Send JSON
+            send_scp_file(
+                scp_config['scp_user'], 
+                json_path, 
+                scp_config['scp_server'], 
+                remote_array_dir, 
+                scp_config['scp_key']
+            )
+        
+    except Exception as e:
+        LOG.error(f"[{threading.current_thread().name}] Error saving data for serial {serial_number}: {e}")
+
+def process_serial_number(serial_number: str, args, TIME_EPOCH: str, TIME_DAYS: str, 
+                         TIME_5MIN: str, scp_config: Dict):
+    """Process a single serial number to collect SPM data"""
+    thread_name = threading.current_thread().name
+    LOG.info(f"[{thread_name}] 🔄 Processing serial number: {serial_number}")
+    
+    try:
+        local_spm_data = []
+        
+        # Get port information for this serial number
+        port_cmd = f"raidcom get port -s {serial_number} -IH{{{args.inst}}}"
+        LOG.info(f"[{thread_name}] Getting ports for serial {serial_number}")
+        
+        port_output = run_command(port_cmd)
+        if not port_output:
+            LOG.warning(f"[{thread_name}] No port data for serial {serial_number}")
+            return
+        
+        # Parse port output with pandas
+        port_df = parse_raidcom_output_with_pandas(port_output)
+        
+        # Extract port IDs
+        port_ids = []
+        if not port_df.empty and 'PORT' in port_df.columns:
+            port_ids = port_df['PORT'].tolist()
+        else:
+            # Fallback to regex
+            port_ids = re.findall(r'CL\d-[A-Z]', port_output)
+        
+        LOG.info(f"[{thread_name}] Found {len(port_ids)} ports for serial {serial_number}")
+        
+        # Process each port
+        for port_id in port_ids:
+            LOG.info(f"[{thread_name}] Checking port {port_id}...")
+            
+            # Get host group information
+            hg_cmd = f"raidcom get host_grp -port {port_id} -s {serial_number} -IH{{{args.inst}}}"
+            hg_output = run_command(hg_cmd)
+            
+            if not hg_output:
+                continue
+            
+            # Parse host groups with pandas
+            hg_df = parse_raidcom_output_with_pandas(hg_output)
+            
+            if hg_df.empty:
+                continue
+            
+            # Get SPM WWN information
+            spm_cmd = f"raidcom get spm_wwn -port {port_id} -s {serial_number} -IH{{{args.inst}}}"
+            spm_output = run_command(spm_cmd)
+            
+            if not spm_output:
+                continue
+            
+            # Parse SPM data with pandas
+            spm_df = parse_raidcom_output_with_pandas(spm_output)
+            
+            if not spm_df.empty:
+                # Process SPM data
+                for idx, row in spm_df.iterrows():
+                    try:
+                        spm_entry = {
+                            "ArraySerial": serial_number,
+                            "ArrayPort": port_id,
+                            "HostNickname": row.get('NICK_NAME', 'Unknown'),
+                            "HostGroup": str(row.get('GROUP', '')),
+                            "HostWWPN": row.get('HBA_WWN', ''),
+                            "MonitorIOps": int(row.get('IOPS', 0)),
+                            "MonitorKBps": int(row.get('KBPS', 0)),
+                            "SPMLimitKBps": int(row.get('SPM_LIMIT', 0)),
+                            "SPMPriority": str(row.get('PRIORITY', '')),
+                            "SourceLoadTimeEpoch": TIME_EPOCH,
+                            "SourceName": "HostIOLimit",
+                            "BatchCreateTimeEpoch": TIME_EPOCH,
+                        }
+                        local_spm_data.append(spm_entry)
+                    except Exception as e:
+                        LOG.error(f"[{thread_name}] Error processing row: {e}")
+        
+        # Save data for this serial number immediately
+        if local_spm_data:
+            process_and_save_serial_data(
+                serial_number, 
+                local_spm_data, 
+                TIME_EPOCH, 
+                args.region, 
+                scp_config
+            )
+            LOG.info(f"[{thread_name}] ✅ Completed serial {serial_number}: {len(local_spm_data)} records")
+        else:
+            LOG.warning(f"[{thread_name}] ⚠️ No data collected for serial {serial_number}")
+        
+    except Exception as e:
+        LOG.error(f"[{thread_name}] ❌ Error processing serial {serial_number}: {e}")
+
+def process_serial_chunk(serial_chunk: List[str], args, TIME_EPOCH: str, 
+                        TIME_DAYS: str, TIME_5MIN: str, scp_config: Dict):
+    """Process a chunk of serial numbers in parallel with 2 threads"""
+    chunk_name = f"Chunk-{'-'.join(serial_chunk)}"
+    LOG.info(f"[{chunk_name}] 📦 Starting chunk with {len(serial_chunk)} serials")
+    
+    # Create threads for each serial number in the chunk
+    threads = []
+    for serial_number in serial_chunk:
+        thread = threading.Thread(
+            target=process_serial_number,
+            args=(serial_number, args, TIME_EPOCH, TIME_DAYS, TIME_5MIN, scp_config),
+            name=f"Serial-{serial_number}"
+        )
+        threads.append(thread)
+        thread.start()
+    
+    # Wait for all threads in this chunk to complete
+    for thread in threads:
+        thread.join()
+    
+    LOG.info(f"[{chunk_name}] ✅ Completed chunk processing")
+
+def show_directory_structure():
+    """Show the generated directory structure"""
+    if os.path.exists("reports"):
+        LOG.info("📂 Generated directory structure:")
+        for root, dirs, files in os.walk("reports"):
+            level = root.replace("reports", "").count(os.sep)
+            indent = "  " * level
+            LOG.info(f"{indent}📁 {os.path.basename(root)}/")
+            subindent = "  " * (level + 1)
+            for file in files:
+                file_size = os.path.getsize(os.path.join(root, file))
+                LOG.info(f"{subindent}📄 {file} ({file_size} bytes)")
+
 def main():
     try:
-        LOG.info("🚀 Starting Raidcom IOLimit Data Collection Script with Multithreading")
+        LOG.info("🚀 Starting Raidcom IOLimit Script v36 - Python 3.6 + Pandas + Immediate SCP")
         
         # Parse arguments
         parser = argparse.ArgumentParser(
-            description="Get data from HDS raidcom IOLIMIT SPM information with multithreading and individual file processing"
+            description="Raidcom IOLimit data collection with pandas and immediate SCP transfer"
         )
         parser.add_argument(
-            "--inst", type=int, required=True, help="Raidcom instance default 99"
+            "--inst", type=int, required=True, help="Raidcom instance (e.g., 99)"
         )
         parser.add_argument(
             "--region",
             type=str,
             required=True,
             choices=["emea", "nam", "latam", "apac"],
-            help="Region [ emea,nam,apac,latam ]",
+            help="Region [emea,nam,apac,latam]",
         )
         parser.add_argument(
-            "--username", type=str, required=False, help="username for raidcom AD user"
+            "--username", type=str, required=False, help="Username for raidcom AD user"
         )
         parser.add_argument(
-            "--password", type=str, required=False, help="password for raidcom AD user"
-        )
-        parser.add_argument(
-            "--threads", type=int, default=2, help="Number of threads to use (default: 2)"
+            "--password", type=str, required=False, help="Password for raidcom AD user"
         )
 
         args = parser.parse_args()
         region = args.region
         
-        LOG.info(f"📊 Configuration: Instance={args.inst}, Region={region}, Threads={args.threads}")
+        LOG.info(f"📊 Configuration: Instance={args.inst}, Region={region}")
         
         # Load configuration
         CONFIG = load_config_file("config/config.cfg")
         api_name = "HITACHI"
         
-        # Get credentials
+        # Get credentials and SCP configuration
         user_salt = CONFIG.get(api_name, "user_salt")
         password_salt = CONFIG.get(api_name, "password_salt")
         scp_user = CONFIG.get(api_name, "scp_user")
         scp_server = CONFIG.get(api_name, "scp_server")
         scp_name = "scp_path_" + args.region
         scp_path = CONFIG.get(api_name, scp_name)
-        
-        # Get SCP key path (IMPORTANT: This was missing!)
         scp_key = CONFIG.get(api_name, "scp_key", fallback="/path/to/scp_key")
         
-        # SCP configuration dictionary (IMPORTANT: Complete configuration!)
+        # SCP configuration dictionary
         scp_config = {
             'scp_user': scp_user,
             'scp_server': scp_server,
@@ -468,12 +471,9 @@ def main():
             'scp_key': scp_key
         }
         
-        LOG.info(f"🔧 SCP Configuration:")
-        LOG.info(f"   Server: {scp_config['scp_server']}")
-        LOG.info(f"   User: {scp_config['scp_user']}")
-        LOG.info(f"   Path: {scp_config['scp_path']}")
-        LOG.info(f"   Key: {scp_config['scp_key']}")
+        LOG.info(f"🔧 SCP Configuration: {scp_config['scp_server']}:{scp_config['scp_path']}")
         
+        # Get credentials
         credentials = get_credentials(user_salt, password_salt, api_name)
         username = credentials[0]
         password = credentials[1]
@@ -483,58 +483,69 @@ def main():
         if not args.password:
             args.password = password
 
-        # Extract timestamps (ALL timestamp formats)
+        # Get all timestamps
         TIME_EPOCH = get_timestamp("epoch")
         TIME_DAYS = get_timestamp("days")
         TIME_5MIN = get_timestamp("5min")
-        TIME_LONG = get_timestamp("hours_min")
-        DIR_TIME_5MIN = get_timestamp("5min")
-        SHORT_TIME = get_timestamp("days")
         
-        LOG.info(f"⏰ Timestamps:")
-        LOG.info(f"   Epoch: {TIME_EPOCH}")
-        LOG.info(f"   Days: {TIME_DAYS}")
-        LOG.info(f"   5Min: {TIME_5MIN}")
+        LOG.info(f"⏰ Timestamp: {TIME_5MIN} (Epoch: {TIME_EPOCH})")
 
-        # Login to instance
-        LOG.info(f"🔐 Login to raidcom with user: {args.username} and Inst: {args.inst} and Region {args.region}")
-        
+        # Login to raidcom
+        LOG.info(f"🔐 Login to raidcom with user: {args.username}")
         login_cmd = f"raidcom -login {args.username} {args.password} -I{args.inst}"
-        run_command(login_cmd)
+        
+        login_result = run_command(login_cmd)
+        if login_result is None:
+            LOG.error("❌ Failed to login to raidcom")
+            sys.exit(1)
 
-        # Get all serial numbers from raidqry -l (CRITICAL STEP!)
-        LOG.info(f"🔍 Getting all serial numbers from instance {args.inst}")
+        # Get all serial numbers
+        LOG.info(f"🔍 Getting serial numbers from instance {args.inst}")
         serial_numbers = get_serial_numbers(args.inst)
         
         if not serial_numbers:
-            LOG.error("❌ No serial numbers found. Exiting.")
+            LOG.error("❌ No serial numbers found")
+            # Logout before exit
+            run_command(f"raidcom -logout -I{args.inst}")
             sys.exit(1)
 
         LOG.info(f"📋 Found {len(serial_numbers)} serial numbers: {serial_numbers}")
 
-        # Process serial numbers in chunks of 2 (MULTITHREADING LOGIC!)
-        chunk_size = 2  # Always process 2 serial numbers at a time as requested
+        # Process in chunks of 2 with parallel threads
+        chunk_size = 2
         serial_chunks = list(chunk_list(serial_numbers, chunk_size))
         
-        LOG.info(f"📦 Processing {len(serial_chunks)} chunks of {chunk_size} serial numbers each")
-        LOG.info(f"🧵 Each chunk will run {chunk_size} threads in parallel")
+        LOG.info(f"📦 Processing {len(serial_chunks)} chunks ({chunk_size} serials per chunk)")
+        LOG.info(f"🧵 Each chunk runs {chunk_size} threads in parallel")
         
-        # Process each chunk sequentially (but within each chunk, process in parallel)
+        # Process each chunk
         for i, chunk in enumerate(serial_chunks):
+            LOG.info(f"")
+            LOG.info(f"{'='*60}")
             LOG.info(f"🔄 Processing chunk {i+1}/{len(serial_chunks)}: {chunk}")
+            LOG.info(f"{'='*60}")
+            
             process_serial_chunk(chunk, args, TIME_EPOCH, TIME_DAYS, TIME_5MIN, scp_config)
+            
             LOG.info(f"✅ Completed chunk {i+1}/{len(serial_chunks)}")
 
-        LOG.info("🎉 All serial numbers processed successfully!")
+        LOG.info(f"")
+        LOG.info(f"{'='*60}")
+        LOG.info("🎉 All processing completed!")
+        LOG.info(f"{'='*60}")
         
-        # Show generated directory structure
+        # Show final directory structure
         show_directory_structure()
         
-        LOG.info("📁 Check 'reports' directory for generated files")
-        LOG.info(f"🌐 Files also sent to {scp_config['scp_server']}:{scp_config['scp_path']}")
+        LOG.info(f"")
+        LOG.info(f"📊 Summary:")
+        LOG.info(f"   - Processed: {len(serial_numbers)} serial numbers")
+        LOG.info(f"   - Chunks: {len(serial_chunks)}")
+        LOG.info(f"   - Files location: reports/{TIME_5MIN}/")
+        LOG.info(f"   - Remote location: {scp_config['scp_server']}:{scp_config['scp_path']}")
 
-        # Logout from instance
-        LOG.info(f"🔓 Logout from inst {args.inst}...")
+        # Logout from raidcom
+        LOG.info(f"🔓 Logout from instance {args.inst}")
         logout_cmd = f"raidcom -logout -I{args.inst}"
         run_command(logout_cmd)
         
@@ -542,6 +553,11 @@ def main():
 
     except Exception as e:
         LOG.critical(f"💥 Critical error: {e}", exc_info=True)
+        # Try to logout even on error
+        try:
+            run_command(f"raidcom -logout -I{args.inst}")
+        except:
+            pass
         sys.exit(1)
 
 
