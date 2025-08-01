@@ -1,166 +1,471 @@
-# Initialize data collection
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Storage Performance Monitor (SPM) Data Collection Script for Hitachi storage arrays.
+Compatible with Python 3.12 - uses only native libraries for NAS environment.
+"""
+
+import subprocess
+import sys
+import os
+import json
+import csv
+import argparse
+import base64
+import datetime
+import time
+import logging
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
+# Setup logging
+LOG = logging.getLogger(__name__)
+
+# Thread lock for shared data access
+data_lock = threading.Lock()
 all_spm_data = []
 
-# Funkcja do wczytania danych referencyjnych z CSV
-def load_reference_csv(csv_file_path):
-    """
-    Wczytuje dane referencyjne z pliku CSV
-    Zakładane kolumny: HWWN, NICK_NAME, GROUP_NAME
-    """
-    try:
-        reference_data = pd.read_csv(csv_file_path)
-        # Opcjonalnie: czyszczenie białych znaków z kolumn tekstowych
-        for col in ['HWWN', 'NICK_NAME', 'GROUP_NAME']:
-            if col in reference_data.columns:
-                reference_data[col] = reference_data[col].astype(str).str.strip()
-        return reference_data
-    except Exception as e:
-        LOG.error(f"Błąd podczas wczytywania pliku CSV: {e}")
-        return pd.DataFrame()
+# Cache for reference data
+reference_data_cache = {}
+RETRY_DELAY = 5  # seconds between retries
+MAX_RETRIES = 3
 
-# Funkcja do wyszukiwania nazwy w danych referencyjnych
-def lookup_nick_name(spm_wwn, reference_data, port_id):
-    """
-    Wyszukuje NICK_NAME dla danego SPM_WWN w danych referencyjnych
-    """
-    if reference_data.empty:
-        return "-"
-    
-    # Szukaj po HWWN == SPM_WWN
-    match = reference_data[reference_data['HWWN'] == spm_wwn]
-    
-    if not match.empty:
-        nick_name = match.iloc[0]['NICK_NAME']
+def get_script_name():
+    """Get the name of the calling script without extension."""
+    script_name = sys.argv[0]
+    return os.path.splitext(os.path.basename(script_name))[0]
+
+def load_config_file(config_file):
+    """Load configuration from file."""
+    config = {}
+    if os.path.exists(config_file):
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+    return config
+
+def get_timestamp(format_type="epoch"):
+    """Get current timestamp in various formats."""
+    timestamp_formats = {
+        "epoch": time.time(),
+        "datetime": datetime.datetime.now(),
+        "hours_min": datetime.datetime.now().strftime("%Y%m%d%H%M"),
+        "days": time.time() / 86400,
+        "sql": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    return timestamp_formats.get(format_type, timestamp_formats["epoch"])
+
+def simple_encrypt(text, key="default_key"):
+    """Simple base64 encoding."""
+    try:
+        encoded = base64.b64encode(text.encode()).decode()
+        return encoded
+    except Exception as e:
+        LOG.error(f"Error encoding: {e}")
+        return text
+
+def simple_decrypt(encoded_text, key="default_key"):
+    """Simple base64 decoding."""
+    try:
+        decoded = base64.b64decode(encoded_text.encode()).decode()
+        return decoded
+    except Exception as e:
+        LOG.error(f"Error decoding: {e}")
+        return encoded_text
+
+def get_credentials(user_salt, password_salt, api_name):
+    """Get credentials from environment or config."""
+    username = simple_decrypt(user_salt)
+    password = simple_decrypt(password_salt)
+    return username, password
+
+def run_command(command):
+    """Execute shell command and return output."""
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        LOG.error(f"Command failed: {command}, Error: {e.stderr}")
+        return None
+
+def send_scp_file(user, file_path, remote_server, remote_path, scp_key):
+    """Send file to remote server using SCP."""
+    try:
+        remote_mkdir_command = f'ssh -i {scp_key} {user}@{remote_server} mkdir -p {remote_path}'
+        run_command(remote_mkdir_command)
         
-        # Jeżeli NICK_NAME nie jest "-", zwróć go
-        if nick_name != "-" and pd.notna(nick_name):
-            LOG.info(f"Znaleziono NICK_NAME w CSV: {nick_name} dla WWN: {spm_wwn}")
+        scp_command = f'scp -i {scp_key} {file_path} {user}@{remote_server}:{remote_path}'
+        result = subprocess.run(scp_command, shell=True, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, scp_command, result.stdout, result.stderr)
+            
+        LOG.info(f"SCP send: {file_path} to {remote_server}:{remote_path}")
+        return True
+    except Exception as e:
+        LOG.error(f"SCP send failed: {file_path}, Error: {e}")
+        return False
+
+def parse_csv_content(content, separator=","):
+    """Parse CSV-like content into list of dictionaries."""
+    lines = content.strip().split('\n')
+    if not lines:
+        return []
+    
+    # Get headers from first line
+    headers = [h.strip() for h in lines[0].split(separator)]
+    data = []
+    
+    for line in lines[1:]:
+        if line.strip():
+            values = [v.strip() for v in line.split(separator)]
+            if len(values) == len(headers):
+                row_dict = {headers[i]: values[i] for i in range(len(headers))}
+                data.append(row_dict)
+    
+    return data
+
+def write_csv_file(filename, data, fieldnames=None):
+    """Write data to CSV file."""
+    if not data:
+        LOG.warning(f"No data to write to {filename}")
+        return
+    
+    if fieldnames is None:
+        fieldnames = list(data[0].keys()) if data else []
+    
+    with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(data)
+    
+    LOG.info(f"Report written to: {filename}")
+
+def calculate_percentage(monitor_kbps, spm_limit_kbps):
+    """Calculate percentage with 2 decimal places."""
+    try:
+        if monitor_kbps and spm_limit_kbps and float(spm_limit_kbps) > 0:
+            return round((float(monitor_kbps) / float(spm_limit_kbps)) * 100, 2)
+        else:
+            return 0
+    except (ValueError, ZeroDivisionError):
+        return 0
+
+def load_reference_csv(csv_file_path):
+    """Load reference CSV file."""
+    global reference_data_cache
+    
+    if csv_file_path in reference_data_cache:
+        return reference_data_cache[csv_file_path]
+    
+    reference_data = []
+    try:
+        if os.path.exists(csv_file_path):
+            with open(csv_file_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                reference_data = list(reader)
+            reference_data_cache[csv_file_path] = reference_data
+            LOG.info(f"Loaded {len(reference_data)} records from {csv_file_path}")
+    except Exception as e:
+        LOG.error(f"Error loading reference CSV: {e}")
+    
+    return reference_data
+
+def lookup_nick_name(spm_wwn, reference_data, port_id):
+    """Lookup nickname for given WWN and port."""
+    LOG.info(f"Looking up NICK_NAME for SPM_WWN: {spm_wwn} in reference data...")
+    
+    if reference_data:
+        # First try exact match
+        match = next((item for item in reference_data 
+                     if item.get('HWWN', '').lower() == spm_wwn.lower()), None)
+        
+        if match and match.get('NICK_NAME'):
+            nick_name = match['NICK_NAME']
+            LOG.info(f"Found NICK_NAME in CSV: {nick_name} for WWN: {spm_wwn}")
             return nick_name
         
-        # Jeżeli NICK_NAME to "-", użyj GROUP_NAME + suffix
-        group_name = match.iloc[0]['GROUP_NAME']
-        if group_name != "-" and pd.notna(group_name):
-            constructed_name = f"{group_name}_*{port_id}"
-            LOG.info(f"Skonstruowano nazwę z GROUP_NAME: {constructed_name} dla WWN: {spm_wwn}")
-            return constructed_name
+        # Try with GROUP_NAME + suffix
+        match = next((item for item in reference_data 
+                     if item.get('HWWN', '').lower() == spm_wwn.lower() 
+                     and item.get('GROUP_NAME')), None)
+        
+        if match:
+            group_name = match['GROUP_NAME']
+            if group_name != "-" and group_name:
+                constructed_name = f"{group_name}_{port_id.split('-')[1]}"
+                LOG.info(f"Add new name based on GROUP_NAME and PORT: {constructed_name} for WWN: {spm_wwn}")
+                return constructed_name
     
-    LOG.warning(f"Nie znaleziono dopasowania dla WWN: {spm_wwn} w danych referencyjnych")
+    LOG.warning(f"No results for WWN: {spm_wwn} in CSV data, returning '-'")
     return "-"
 
-# Wczytaj dane referencyjne z CSV (dostosuj ścieżkę do swojego pliku)
-CSV_FILE_PATH = "your_reference_file.csv"  # Zmień na właściwą ścieżkę
-reference_data = load_reference_csv(CSV_FILE_PATH)
+def parse_spm_monitor_data(output):
+    """Parse SPM monitor command output."""
+    if not output:
+        return None
+    
+    lines = output.strip().split('\n')
+    
+    # Look for data line (numbers separated by spaces)
+    for line in lines:
+        # Skip header lines and empty lines
+        if 'PORT' in line or 'SPM' in line or not line.strip():
+            continue
+        
+        # Match lines with numbers (IOps, SPM_MD, PRI format)
+        parts = line.strip().split()
+        if len(parts) >= 2 and all(p.isdigit() for p in parts[:2]):
+            try:
+                return {
+                    'IOps': int(parts[0]),
+                    'MonitorKBps': int(parts[1]),
+                    'SPMLimitKBps': int(parts[2]) if len(parts) > 2 else int(parts[1])
+                }
+            except (ValueError, IndexError) as e:
+                LOG.warning(f"Failed to parse monitor data line: {line}, error: {e}")
+    
+    return None
 
-# For each port, check host groups and WWPNs
-for port_id in port_ids:
-    # raidcom get spm_wwn -port ${i} -s ${JFRAMERET} -IH${HORCMINST}
-    host_cmd = f"raidcom get spm_wwn -port {port_id} -s {serial_number} -I{args.inst}"
+def process_host_port(host_data, port_id, config, args, reference_data):
+    """Process single host-port combination."""
+    local_spm_data = []
+    array_serial = args.serial
+    instance = args.inst
+    
+    try:
+        # Get SPM WWNs for this host on this port
+        get_cmd = f"raidcom get spm_wwn -port {port_id} -hba_wwn {host_data['wwpn']} -s {array_serial} -I{instance}"
+        LOG.info(f"Getting SPM data for port {port_id}: {get_cmd}")
+        
+        spm_output = run_command(get_cmd)
+        
+        if not spm_output or "No Data found" in spm_output:
+            LOG.info(f"No SPM data found for port {port_id}")
+            return local_spm_data
+        
+        # Extract WWPNs from output
+        wwpn_pattern = r'([0-9a-fA-F]{16})'
+        found_wwpns = re.findall(wwpn_pattern, spm_output)
+        
+        if not found_wwpns:
+            LOG.warning(f"No WWPNs found in output for port {port_id}")
+            return local_spm_data
+        
+        # Process each found WWPN
+        for target_wwpn in found_wwpns:
+            # Skip if it's the host WWPN
+            if target_wwpn.lower() == host_data['wwpn'].lower():
+                continue
+            
+            # Get monitor data
+            monitor_cmd = f"raidcom monitor spm_wwn -hba_wwn {host_data['wwpn']} -port {port_id} -s {array_serial} -I{instance}"
+            LOG.info(f"Monitoring SPM for WWPN {target_wwpn}: {monitor_cmd}")
+            
+            monitor_output = run_command(monitor_cmd)
+            
+            if monitor_output:
+                monitor_data = parse_spm_monitor_data(monitor_output)
+                
+                if monitor_data:
+                    # Lookup nickname
+                    host_nickname = lookup_nick_name(host_data['wwpn'], reference_data, port_id)
+                    
+                    # Create SPM entry
+                    spm_entry = {
+                        'ArraySerial': array_serial,
+                        'ArrayPort': port_id,
+                        'HostNickName': host_nickname,
+                        'HostWWPN': host_data['wwpn'],
+                        'HostGroup': host_data.get('group', 'Unknown'),
+                        'HostOS': host_data.get('os', 'Unknown'),
+                        'MonitorIOps': monitor_data['IOps'],
+                        'MonitorKBps': monitor_data['MonitorKBps'],
+                        'SPMLimitKBps': monitor_data['SPMLimitKBps'],
+                        'SPMTransfer': 0,  # Default value
+                        'SPMPriority': 'Unknown',
+                        'SourceLoadTimeEpoch': get_timestamp("epoch"),
+                        'SourceName': 'HostIOLimit',
+                        'BatchCreateTimeEpoch': get_timestamp("epoch")
+                    }
+                    
+                    local_spm_data.append(spm_entry)
+                    LOG.info(f"Added SPM data: IOps={monitor_data['IOps']}, Port={port_id}, Host={host_nickname}")
+                else:
+                    LOG.warning(f"Failed to parse monitor data for WWPN {target_wwpn}")
+            else:
+                LOG.warning(f"No monitor output for WWPN {target_wwpn}")
+    
+    except Exception as e:
+        LOG.error(f"Error processing host {host_data.get('wwpn', 'Unknown')} on port {port_id}: {e}")
+    
+    return local_spm_data
+
+def main():
+    # Parse arguments
+    parser = argparse.ArgumentParser(description="SPM data collection script")
+    parser.add_argument("--inst", type=int, required=True, help="Instance number")
+    parser.add_argument("--serial", type=str, required=True, help="Array serial number")
+    parser.add_argument("--username", type=str, help="Username")
+    parser.add_argument("--password", type=str, help="Password")
+    parser.add_argument("--region", type=str, help="Region")
+    args = parser.parse_args()
+    
+    # Setup logging
+    log_filename = f"{get_script_name()}_{args.serial}_{get_timestamp('hours_min')}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        filename=log_filename
+    )
+    
+    # Load configuration
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.cfg")
+    config = load_config_file(config_path)
+    
+    # Get credentials
+    FILE_OUTPUT = config.get('api_name', 'file_name_wwn')
+    user_salt = config.get('user_salt')
+    password_salt = config.get('password_salt')
+    scp_user = config.get('scp_user')
+    scp_server = config.get('scp_server')
+    scp_path = config.get('scp_path', '.')
+    scp_name = f"scp_path_{args.region}" if args.region else "scp_path"
+    scp_path = config.get(scp_name, scp_path)
+    scp_key = config.get('scp_key')
+    
+    username, password = get_credentials(user_salt, password_salt, FILE_OUTPUT)
+    
+    # Load reference data
+    reference_csv_file = config.get('reference_csv_file_path', '')
+    reference_data = load_reference_csv(reference_csv_file) if reference_csv_file else []
+    
+    # Get storage array information
+    LOG.info(f"Getting storage arrays from Region {args.region}, Horcm inst: {args.inst}")
+    
+    raidql_cmd = f"raidqry -I -I{args.inst}"
+    raidql_output = run_command(raidql_cmd)
+    
+    if not raidql_output:
+        LOG.error("Failed to get storage array information")
+        sys.exit(1)
+    
+    # Parse array information
+    array_serial = args.serial
+    LOG.info(f"Processing array serial: {array_serial}")
+    
+    # Get port list
+    port_cmd = f"raidcom get port -s {array_serial} -I{args.inst}"
+    port_output = run_command(port_cmd)
+    
+    if not port_output:
+        LOG.error("Failed to get port information")
+        sys.exit(1)
+    
+    # Parse ports (looking for CL ports)
+    port_ids = []
+    for line in port_output.split('\n'):
+        if 'CL' in line and '-' in line:
+            parts = line.split()
+            if parts:
+                port_id = parts[0]
+                if re.match(r'CL\d+-[A-Z]', port_id):
+                    port_ids.append(port_id)
+    
+    LOG.info(f"Found {len(port_ids)} ports to process")
+    
+    # Get host WWPNs
+    host_cmd = f"raidcom get host_grp -port CL1-A -s {array_serial} -I{args.inst}"
     host_output = run_command(host_cmd)
     
-    if not host_output:
-        # LOG.warning(f"No data found for port {port_id}.")
-        continue
-    else:
-        LOG.info(
-            f"Data found in host_output. for port {port_id}, {len(host_output)} lines"
-        )
-        # raidcom get spm_wwn -port CL8-A -s 561564 -IH99
-        # PORT SPM_MD    SPM_WWN  NICK_NAME    GRP_NAME        Serial#
-        # CL8-A WWN    10000440c9d0b045 SPM_1rdttsafewdbn1u_b045_CL8-A - 56
-
-        # Convert the output string into a pandas DataFrame
-        host_data = pd.read_csv(StringIO(host_output), sep=r"\s+")
-
-        # Jeżeli w host_data nie ma wyniku dla NICK_NAME wtedy poszukaj w tabeli z danej macierz
-        if host_data["NICK_NAME"].values[0] == "-":
-            LOG.warning(
-                f"No data found for NICK_NAME {host_data['NICK_NAME'].values[0]} in host_data, sta"
-                # Start search in tables with HOSTGROUP and NICK
-            )
-            continue
-
-        # Check if the DataFrame is empty
-        if not host_data.empty:
-            LOG.info(f"Data found in host_output. in port {port_id}.")
-            
-            # Aktualizuj NICK_NAME dla rekordów z wartością "-"
-            for idx, row in host_data.iterrows():
-                if row['NICK_NAME'] == "-":
-                    spm_wwn = row['SPM_WWN']
-                    new_nick_name = lookup_nick_name(spm_wwn, reference_data, port_id)
-                    host_data.at[idx, 'NICK_NAME'] = new_nick_name
-                    LOG.info(f"Zaktualizowano NICK_NAME dla WWN {spm_wwn}: {new_nick_name}")
-            
-            # Extract WWPNs
-            wwpns = re.findall(r"([0-9A-Fa-f]{16})", host_output)
-            # LOG.info(f"Found wwpn: {wwpns}.")
-
-            for host_wwpn in wwpns:
-                spm_cmd = f"raidcom get spm_wwn -port {port_id} -hba_wwn {host_wwpn} -s {serial_number}"
-                spm_output = run_command(spm_cmd)
-
-                # Convert the output string into a pandas DataFrame
-                spm_get_data = pd.read_csv(StringIO(spm_output), sep=r"\s+")
-
-                if not spm_get_data.empty:
-                    LOG.info(
-                        f"Data found in spm_get_data for WWPN: {host_wwpn} in port: {port_id}."
-                    )
-                    
-                    # Aktualizuj NICK_NAME także w spm_get_data jeśli potrzeba
-                    for idx, row in spm_get_data.iterrows():
-                        if row.get('NICK_NAME', '') == "-":
-                            spm_wwn = row.get('SPM_WWN', '')
-                            if spm_wwn:
-                                new_nick_name = lookup_nick_name(spm_wwn, reference_data, port_id)
-                                smp_get_data.at[idx, 'NICK_NAME'] = new_nick_name
-                                LOG.info(f"Zaktualizowano NICK_NAME w spm_get_data dla WWN {spm_wwn}: {new_nick_name}")
-                    
-                    # Dodaj dane do głównej kolekcji
-                    all_spm_data.append({
-                        'port_id': port_id,
-                        'host_data': host_data,
-                        'spm_data': smp_get_data,
-                        'wwpn': host_wwpn
+    host_wwpns = []
+    if host_output:
+        # Parse host groups and WWPNs
+        for line in host_output.split('\n'):
+            wwpn_match = re.search(r'([0-9a-fA-F]{16})', line)
+            if wwpn_match:
+                wwpn = wwpn_match.group(1)
+                if wwpn not in [h['wwpn'] for h in host_wwpns]:
+                    host_wwpns.append({
+                        'wwpn': wwpn,
+                        'group': 'Unknown',
+                        'os': 'Unknown'
                     })
-                else:
-                    LOG.warning(f"No SPM data found for WWPN: {host_wwpn} in port: {port_id}")
-
-# Przykład użycia zebranych danych z zaktualizowanymi nazwami
-LOG.info(f"Zebrano dane dla {len(all_spm_data)} kombinacji port/WWPN")
-
-# Opcjonalnie: eksport zaktualizowanych danych do pliku
-def export_updated_data(all_data, output_file="updated_spm_data.csv"):
-    """
-    Eksportuje zaktualizowane dane do pliku CSV
-    """
-    export_records = []
     
-    for data_entry in all_data:
-        port_id = data_entry['port_id']
-        host_data = data_entry['host_data']
-        spm_data = data_entry['spm_data']
-        wwpn = data_entry['wwpn']
+    LOG.info(f"Found {len(host_wwpns)} host WWPNs to process")
+    
+    # Process each host-port combination using thread pool
+    global all_spm_data
+    max_workers = min(10, len(host_wwpns) * len(port_ids))
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
         
-        # Kombinuj dane z host_data i spm_data
-        for _, host_row in host_data.iterrows():
-            for _, spm_row in smp_data.iterrows():
-                export_records.append({
-                    'PORT_ID': port_id,
-                    'WWPN': wwpn,
-                    'SPM_WWN': spm_row.get('SPM_WWN', ''),
-                    'NICK_NAME': spm_row.get('NICK_NAME', ''),
-                    'GRP_NAME': host_row.get('GRP_NAME', ''),
-                    'SPM_MD': spm_row.get('SPM_MD', ''),
-                    'Serial': smp_row.get('Serial#', '')
-                })
+        for host_data in host_wwpns:
+            for port_id in port_ids:
+                future = executor.submit(process_host_port, host_data, port_id, config, args, reference_data)
+                futures.append(future)
+        
+        # Collect results
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result:
+                    with data_lock:
+                        all_spm_data.extend(result)
+            except Exception as e:
+                LOG.error(f"Thread execution error: {e}")
     
-    if export_records:
-        export_df = pd.DataFrame(export_records)
-        export_df.to_csv(output_file, index=False)
-        LOG.info(f"Wyeksportowano {len(export_records)} rekordów do {output_file}")
+    # Create DataFrame equivalent structure and save to CSV
+    if all_spm_data:
+        LOG.info(f"Total SPM data collected: {len(all_spm_data)} records for array serial {array_serial}")
+        
+        # Define fieldnames for consistent CSV output
+        fieldnames = [
+            'ArraySerial', 'ArrayPort', 'HostNickName', 'HostWWPN', 
+            'HostGroup', 'HostOS', 'MonitorIOps', 'MonitorKBps', 
+            'SPMLimitKBps', 'SPMTransfer', 'SPMPriority',
+            'SourceLoadTimeEpoch', 'SourceName', 'BatchCreateTimeEpoch'
+        ]
+        
+        # Calculate SPMLimitUtilPct
+        for entry in all_spm_data:
+            entry['SPMLimitUtilPct'] = calculate_percentage(
+                entry.get('MonitorKBps', 0),
+                entry.get('SPMLimitKBps', 1)
+            )
+        
+        # Add SPMLimitUtilPct to fieldnames
+        if 'SPMLimitUtilPct' not in fieldnames:
+            fieldnames.insert(fieldnames.index('SPMTransfer'), 'SPMLimitUtilPct')
+        
+        # Create CSV filename
+        csv_filename = f"nds_iolimit_export_{args.region}_{array_serial}_{get_timestamp('hours_min')}.csv"
+        csv_filepath = os.path.join('.', csv_filename)
+        
+        # Write to CSV
+        write_csv_file(csv_filepath, all_spm_data, fieldnames)
+        
+        # Send file to remote server using SCP
+        scp_path_time = os.path.join(scp_path, f"DIM_{get_timestamp('hours_min')}")
+        send_scp_file(scp_user, csv_filepath, scp_server, scp_path_time, scp_key)
+        
+        LOG.info(f"File {csv_filename} sent to {scp_server}:{scp_path_time}")
+    else:
+        LOG.warning(f"No SPM data to save from storage array {array_serial}")
     
-    return export_records
+    # Logout from instance
+    LOG.info("Logout from inst")
+    logout_cmd = f"raidcom -logout -I{args.inst}"
+    run_command(logout_cmd)
 
-# Wywołaj eksport jeśli potrzeba
-# updated_records = export_updated_data(all_spm_data)
+
+if __name__ == "__main__":
+    main()
