@@ -1,0 +1,166 @@
+# Initialize data collection
+all_spm_data = []
+
+# Funkcja do wczytania danych referencyjnych z CSV
+def load_reference_csv(csv_file_path):
+    """
+    Wczytuje dane referencyjne z pliku CSV
+    Zakładane kolumny: HWWN, NICK_NAME, GROUP_NAME
+    """
+    try:
+        reference_data = pd.read_csv(csv_file_path)
+        # Opcjonalnie: czyszczenie białych znaków z kolumn tekstowych
+        for col in ['HWWN', 'NICK_NAME', 'GROUP_NAME']:
+            if col in reference_data.columns:
+                reference_data[col] = reference_data[col].astype(str).str.strip()
+        return reference_data
+    except Exception as e:
+        LOG.error(f"Błąd podczas wczytywania pliku CSV: {e}")
+        return pd.DataFrame()
+
+# Funkcja do wyszukiwania nazwy w danych referencyjnych
+def lookup_nick_name(spm_wwn, reference_data, port_id):
+    """
+    Wyszukuje NICK_NAME dla danego SPM_WWN w danych referencyjnych
+    """
+    if reference_data.empty:
+        return "-"
+    
+    # Szukaj po HWWN == SPM_WWN
+    match = reference_data[reference_data['HWWN'] == spm_wwn]
+    
+    if not match.empty:
+        nick_name = match.iloc[0]['NICK_NAME']
+        
+        # Jeżeli NICK_NAME nie jest "-", zwróć go
+        if nick_name != "-" and pd.notna(nick_name):
+            LOG.info(f"Znaleziono NICK_NAME w CSV: {nick_name} dla WWN: {spm_wwn}")
+            return nick_name
+        
+        # Jeżeli NICK_NAME to "-", użyj GROUP_NAME + suffix
+        group_name = match.iloc[0]['GROUP_NAME']
+        if group_name != "-" and pd.notna(group_name):
+            constructed_name = f"{group_name}_*{port_id}"
+            LOG.info(f"Skonstruowano nazwę z GROUP_NAME: {constructed_name} dla WWN: {spm_wwn}")
+            return constructed_name
+    
+    LOG.warning(f"Nie znaleziono dopasowania dla WWN: {spm_wwn} w danych referencyjnych")
+    return "-"
+
+# Wczytaj dane referencyjne z CSV (dostosuj ścieżkę do swojego pliku)
+CSV_FILE_PATH = "your_reference_file.csv"  # Zmień na właściwą ścieżkę
+reference_data = load_reference_csv(CSV_FILE_PATH)
+
+# For each port, check host groups and WWPNs
+for port_id in port_ids:
+    # raidcom get spm_wwn -port ${i} -s ${JFRAMERET} -IH${HORCMINST}
+    host_cmd = f"raidcom get spm_wwn -port {port_id} -s {serial_number} -I{args.inst}"
+    host_output = run_command(host_cmd)
+    
+    if not host_output:
+        # LOG.warning(f"No data found for port {port_id}.")
+        continue
+    else:
+        LOG.info(
+            f"Data found in host_output. for port {port_id}, {len(host_output)} lines"
+        )
+        # raidcom get spm_wwn -port CL8-A -s 561564 -IH99
+        # PORT SPM_MD    SPM_WWN  NICK_NAME    GRP_NAME        Serial#
+        # CL8-A WWN    10000440c9d0b045 SPM_1rdttsafewdbn1u_b045_CL8-A - 56
+
+        # Convert the output string into a pandas DataFrame
+        host_data = pd.read_csv(StringIO(host_output), sep=r"\s+")
+
+        # Jeżeli w host_data nie ma wyniku dla NICK_NAME wtedy poszukaj w tabeli z danej macierz
+        if host_data["NICK_NAME"].values[0] == "-":
+            LOG.warning(
+                f"No data found for NICK_NAME {host_data['NICK_NAME'].values[0]} in host_data, sta"
+                # Start search in tables with HOSTGROUP and NICK
+            )
+            continue
+
+        # Check if the DataFrame is empty
+        if not host_data.empty:
+            LOG.info(f"Data found in host_output. in port {port_id}.")
+            
+            # Aktualizuj NICK_NAME dla rekordów z wartością "-"
+            for idx, row in host_data.iterrows():
+                if row['NICK_NAME'] == "-":
+                    spm_wwn = row['SPM_WWN']
+                    new_nick_name = lookup_nick_name(spm_wwn, reference_data, port_id)
+                    host_data.at[idx, 'NICK_NAME'] = new_nick_name
+                    LOG.info(f"Zaktualizowano NICK_NAME dla WWN {spm_wwn}: {new_nick_name}")
+            
+            # Extract WWPNs
+            wwpns = re.findall(r"([0-9A-Fa-f]{16})", host_output)
+            # LOG.info(f"Found wwpn: {wwpns}.")
+
+            for host_wwpn in wwpns:
+                spm_cmd = f"raidcom get spm_wwn -port {port_id} -hba_wwn {host_wwpn} -s {serial_number}"
+                spm_output = run_command(spm_cmd)
+
+                # Convert the output string into a pandas DataFrame
+                spm_get_data = pd.read_csv(StringIO(spm_output), sep=r"\s+")
+
+                if not spm_get_data.empty:
+                    LOG.info(
+                        f"Data found in spm_get_data for WWPN: {host_wwpn} in port: {port_id}."
+                    )
+                    
+                    # Aktualizuj NICK_NAME także w spm_get_data jeśli potrzeba
+                    for idx, row in spm_get_data.iterrows():
+                        if row.get('NICK_NAME', '') == "-":
+                            spm_wwn = row.get('SPM_WWN', '')
+                            if spm_wwn:
+                                new_nick_name = lookup_nick_name(spm_wwn, reference_data, port_id)
+                                smp_get_data.at[idx, 'NICK_NAME'] = new_nick_name
+                                LOG.info(f"Zaktualizowano NICK_NAME w spm_get_data dla WWN {spm_wwn}: {new_nick_name}")
+                    
+                    # Dodaj dane do głównej kolekcji
+                    all_spm_data.append({
+                        'port_id': port_id,
+                        'host_data': host_data,
+                        'spm_data': smp_get_data,
+                        'wwpn': host_wwpn
+                    })
+                else:
+                    LOG.warning(f"No SPM data found for WWPN: {host_wwpn} in port: {port_id}")
+
+# Przykład użycia zebranych danych z zaktualizowanymi nazwami
+LOG.info(f"Zebrano dane dla {len(all_spm_data)} kombinacji port/WWPN")
+
+# Opcjonalnie: eksport zaktualizowanych danych do pliku
+def export_updated_data(all_data, output_file="updated_spm_data.csv"):
+    """
+    Eksportuje zaktualizowane dane do pliku CSV
+    """
+    export_records = []
+    
+    for data_entry in all_data:
+        port_id = data_entry['port_id']
+        host_data = data_entry['host_data']
+        spm_data = data_entry['spm_data']
+        wwpn = data_entry['wwpn']
+        
+        # Kombinuj dane z host_data i spm_data
+        for _, host_row in host_data.iterrows():
+            for _, spm_row in smp_data.iterrows():
+                export_records.append({
+                    'PORT_ID': port_id,
+                    'WWPN': wwpn,
+                    'SPM_WWN': spm_row.get('SPM_WWN', ''),
+                    'NICK_NAME': spm_row.get('NICK_NAME', ''),
+                    'GRP_NAME': host_row.get('GRP_NAME', ''),
+                    'SPM_MD': spm_row.get('SPM_MD', ''),
+                    'Serial': smp_row.get('Serial#', '')
+                })
+    
+    if export_records:
+        export_df = pd.DataFrame(export_records)
+        export_df.to_csv(output_file, index=False)
+        LOG.info(f"Wyeksportowano {len(export_records)} rekordów do {output_file}")
+    
+    return export_records
+
+# Wywołaj eksport jeśli potrzeba
+# updated_records = export_updated_data(all_spm_data)
