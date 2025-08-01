@@ -1,0 +1,164 @@
+import subprocess
+import re
+import pandas as pd
+from io import StringIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
+
+# Konfiguracja logowania
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def run_command(command):
+    """Execute a shell command and return the output."""
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error executing command: {command}, Error: {e.stderr}")
+        return None
+
+def process_port(port, instance, serial_number):
+    """Process a single port to get HBA WWN data and return DataFrame."""
+    logger.info(f"Processing port: {port}")
+    
+    hba_wwn_cmd = f"raidcom get hba_wwn -port -{port} -I{instance} -s {serial_number}"
+    hba_wwn_output = run_command(hba_wwn_cmd)
+    
+    if hba_wwn_output:
+        try:
+            # Convert the output string into a Pandas DataFrame
+            df = pd.read_csv(StringIO(hba_wwn_output), sep=r'\s+')
+            logger.info(f"HBA_WWN data for port {port}: {df.shape}")
+            
+            # Select only the desired columns if they exist
+            required_columns = ["GROUP_NAME", "HWWN", "NICK_NAME"]
+            available_columns = [col for col in required_columns if col in df.columns]
+            
+            if available_columns:
+                selected_data = df[available_columns].copy()
+                # Add port information
+                selected_data['PORT'] = port
+                logger.info(f"Successfully processed port {port}: {len(selected_data)} rows")
+                return selected_data
+            else:
+                logger.warning(f"Required columns not found in port {port} data")
+                return pd.DataFrame()
+                
+        except Exception as e:
+            logger.error(f"Error processing HBA WWN data for port {port}: {e}")
+            return pd.DataFrame()
+    else:
+        logger.warning(f"No HBA WWN output for port {port}")
+        return pd.DataFrame()
+
+def get_host_groups_and_process(instance="99", serial_number="531183", max_workers=4):
+    """Main function to get host groups and process ports concurrently."""
+    
+    # Step 1: Get host groups
+    logger.info("Starting host group retrieval...")
+    host_grp_cmd = f"raidcom get host_grp -allports -I{instance} -s {serial_number}"
+    host_grp_output = run_command(host_grp_cmd)
+    
+    # Initialize an empty list to collect DataFrames
+    dataframes = []
+    
+    if host_grp_output:
+        # Process the output to extract ports in the format "PORT-GRP"
+        ports = []
+        for line in host_grp_output.split("\n"):
+            line_parts = line.split()
+            if len(line_parts) >= 2 and "PORT" not in line and line.strip():
+                port_info = f"{line_parts[0]}-{line_parts[1]}"
+                ports.append(port_info)
+        
+        logger.info(f"Found {len(ports)} ports to process: {ports}")
+        
+        if not ports:
+            logger.warning("No ports found to process")
+            return pd.DataFrame(columns=["GROUP_NAME", "HWWN", "NICK_NAME", "PORT"])
+        
+        # Step 2: Use ThreadPoolExecutor to process ports concurrently
+        logger.info(f"Starting concurrent processing with {max_workers} workers...")
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_port = {
+                executor.submit(process_port, port, instance, serial_number): port 
+                for port in ports
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_port):
+                port = future_to_port[future]
+                try:
+                    result_df = future.result()
+                    if not result_df.empty:
+                        dataframes.append(result_df)
+                        logger.info(f"Successfully collected data for port {port}")
+                    else:
+                        logger.warning(f"No data returned for port {port}")
+                except Exception as e:
+                    logger.error(f"Error processing port {port}: {e}")
+    
+    else:
+        logger.error("No host group output received")
+        return pd.DataFrame(columns=["GROUP_NAME", "HWWN", "NICK_NAME", "PORT"])
+    
+    # Combine all DataFrames
+    if dataframes:
+        logger.info(f"Combining {len(dataframes)} DataFrames...")
+        combined_df = pd.concat(dataframes, ignore_index=True)
+        logger.info(f"Final DataFrame shape: {combined_df.shape}")
+        
+        # Reorder columns for better readability
+        column_order = ["PORT", "GROUP_NAME", "HWWN", "NICK_NAME"]
+        available_columns = [col for col in column_order if col in combined_df.columns]
+        combined_df = combined_df[available_columns]
+        
+        return combined_df
+    else:
+        logger.warning("No data collected from any port")
+        return pd.DataFrame(columns=["GROUP_NAME", "HWWN", "NICK_NAME", "PORT"])
+
+def main():
+    """Main execution function."""
+    try:
+        # Execute the main process
+        result_df = get_host_groups_and_process(
+            instance="99", 
+            serial_number="531183", 
+            max_workers=4
+        )
+        
+        # Display the combined DataFrame
+        if not result_df.empty:
+            print("\n" + "="*80)
+            print("FINAL RESULTS:")
+            print("="*80)
+            print(result_df.to_string(index=False))
+            print(f"\nTotal records: {len(result_df)}")
+            
+            # Optional: Save to CSV
+            output_filename = "hba_wwn_results.csv"
+            result_df.to_csv(output_filename, index=False)
+            logger.info(f"Results saved to {output_filename}")
+            
+        else:
+            print("No data was collected.")
+            
+    except KeyboardInterrupt:
+        logger.info("Process interrupted by user")
+    except Exception as e:
+        logger.error(f"Unexpected error in main execution: {e}")
+        raise
+
+if __name__ == "__main__":
+    main()
