@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 Storage Performance Monitor (SPM) Data Collection Script for Hitachi storage arrays.
-Compatible with Python 3.12 - uses only native libraries for NAS environment.
+Compatible with Python 3.12 - uses pandas for data processing.
 """
 
 import subprocess
 import sys
 import os
 import json
-import csv
+import pandas as pd
 import argparse
 import base64
 import datetime
@@ -114,44 +114,19 @@ def send_scp_file(user, file_path, remote_server, remote_path, scp_key):
         return False
 
 def parse_csv_content(content, separator=","):
-    """Parse CSV-like content into list of dictionaries."""
-    lines = content.strip().split('\n')
-    if not lines:
-        return []
-    
-    # Get headers from first line
-    headers = [h.strip() for h in lines[0].split(separator)]
-    data = []
-    
-    for line in lines[1:]:
-        if line.strip():
-            values = [v.strip() for v in line.split(separator)]
-            if len(values) == len(headers):
-                row_dict = {headers[i]: values[i] for i in range(len(headers))}
-                data.append(row_dict)
-    
-    return data
-
-def write_csv_file(filename, data, fieldnames=None):
-    """Write data to CSV file."""
-    if not data:
-        LOG.warning(f"No data to write to {filename}")
-        return
-    
-    if fieldnames is None:
-        fieldnames = list(data[0].keys()) if data else []
-    
-    with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(data)
-    
-    LOG.info(f"Report written to: {filename}")
+    """Parse CSV-like content into pandas DataFrame."""
+    from io import StringIO
+    try:
+        df = pd.read_csv(StringIO(content), sep=separator)
+        return df
+    except Exception as e:
+        LOG.error(f"Error parsing CSV content: {e}")
+        return pd.DataFrame()
 
 def calculate_percentage(monitor_kbps, spm_limit_kbps):
     """Calculate percentage with 2 decimal places."""
     try:
-        if monitor_kbps and spm_limit_kbps and float(spm_limit_kbps) > 0:
+        if pd.notna(monitor_kbps) and pd.notna(spm_limit_kbps) and float(spm_limit_kbps) > 0:
             return round((float(monitor_kbps) / float(spm_limit_kbps)) * 100, 2)
         else:
             return 0
@@ -159,46 +134,40 @@ def calculate_percentage(monitor_kbps, spm_limit_kbps):
         return 0
 
 def load_reference_csv(csv_file_path):
-    """Load reference CSV file."""
+    """Load reference CSV file into pandas DataFrame."""
     global reference_data_cache
     
     if csv_file_path in reference_data_cache:
         return reference_data_cache[csv_file_path]
     
-    reference_data = []
     try:
         if os.path.exists(csv_file_path):
-            with open(csv_file_path, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                reference_data = list(reader)
+            reference_data = pd.read_csv(csv_file_path)
             reference_data_cache[csv_file_path] = reference_data
             LOG.info(f"Loaded {len(reference_data)} records from {csv_file_path}")
+            return reference_data
     except Exception as e:
         LOG.error(f"Error loading reference CSV: {e}")
     
-    return reference_data
+    return pd.DataFrame()
 
 def lookup_nick_name(spm_wwn, reference_data, port_id):
     """Lookup nickname for given WWN and port."""
     LOG.info(f"Looking up NICK_NAME for SPM_WWN: {spm_wwn} in reference data...")
     
-    if reference_data:
+    if not reference_data.empty:
         # First try exact match
-        match = next((item for item in reference_data 
-                     if item.get('HWWN', '').lower() == spm_wwn.lower()), None)
+        mask = reference_data['HWWN'].str.lower() == spm_wwn.lower()
+        matches = reference_data[mask]
         
-        if match and match.get('NICK_NAME'):
-            nick_name = match['NICK_NAME']
+        if not matches.empty and pd.notna(matches.iloc[0].get('NICK_NAME')):
+            nick_name = matches.iloc[0]['NICK_NAME']
             LOG.info(f"Found NICK_NAME in CSV: {nick_name} for WWN: {spm_wwn}")
             return nick_name
         
         # Try with GROUP_NAME + suffix
-        match = next((item for item in reference_data 
-                     if item.get('HWWN', '').lower() == spm_wwn.lower() 
-                     and item.get('GROUP_NAME')), None)
-        
-        if match:
-            group_name = match['GROUP_NAME']
+        if not matches.empty and pd.notna(matches.iloc[0].get('GROUP_NAME')):
+            group_name = matches.iloc[0]['GROUP_NAME']
             if group_name != "-" and group_name:
                 constructed_name = f"{group_name}_{port_id.split('-')[1]}"
                 LOG.info(f"Add new name based on GROUP_NAME and PORT: {constructed_name} for WWN: {spm_wwn}")
@@ -345,7 +314,7 @@ def main():
     
     # Load reference data
     reference_csv_file = config.get('reference_csv_file_path', '')
-    reference_data = load_reference_csv(reference_csv_file) if reference_csv_file else []
+    reference_data = load_reference_csv(reference_csv_file) if reference_csv_file else pd.DataFrame()
     
     # Get storage array information
     LOG.info(f"Getting storage arrays from Region {args.region}, Horcm inst: {args.inst}")
@@ -423,35 +392,41 @@ def main():
             except Exception as e:
                 LOG.error(f"Thread execution error: {e}")
     
-    # Create DataFrame equivalent structure and save to CSV
+    # Create DataFrame and save to CSV
     if all_spm_data:
         LOG.info(f"Total SPM data collected: {len(all_spm_data)} records for array serial {array_serial}")
         
-        # Define fieldnames for consistent CSV output
-        fieldnames = [
+        # Convert to pandas DataFrame
+        df = pd.DataFrame(all_spm_data)
+        
+        # Calculate SPMLimitUtilPct
+        df['SPMLimitUtilPct'] = df.apply(
+            lambda row: calculate_percentage(row['MonitorKBps'], row['SPMLimitKBps']), 
+            axis=1
+        )
+        
+        # Reorder columns
+        column_order = [
             'ArraySerial', 'ArrayPort', 'HostNickName', 'HostWWPN', 
             'HostGroup', 'HostOS', 'MonitorIOps', 'MonitorKBps', 
-            'SPMLimitKBps', 'SPMTransfer', 'SPMPriority',
+            'SPMLimitKBps', 'SPMLimitUtilPct', 'SPMTransfer', 'SPMPriority',
             'SourceLoadTimeEpoch', 'SourceName', 'BatchCreateTimeEpoch'
         ]
         
-        # Calculate SPMLimitUtilPct
-        for entry in all_spm_data:
-            entry['SPMLimitUtilPct'] = calculate_percentage(
-                entry.get('MonitorKBps', 0),
-                entry.get('SPMLimitKBps', 1)
-            )
+        # Ensure all columns exist
+        for col in column_order:
+            if col not in df.columns:
+                df[col] = pd.NA
         
-        # Add SPMLimitUtilPct to fieldnames
-        if 'SPMLimitUtilPct' not in fieldnames:
-            fieldnames.insert(fieldnames.index('SPMTransfer'), 'SPMLimitUtilPct')
+        df = df[column_order]
         
         # Create CSV filename
         csv_filename = f"nds_iolimit_export_{args.region}_{array_serial}_{get_timestamp('hours_min')}.csv"
         csv_filepath = os.path.join('.', csv_filename)
         
-        # Write to CSV
-        write_csv_file(csv_filepath, all_spm_data, fieldnames)
+        # Write to CSV using pandas
+        df.to_csv(csv_filepath, index=False)
+        LOG.info(f"Report SPM written to file: {csv_filepath}, {len(df)} records")
         
         # Send file to remote server using SCP
         scp_path_time = os.path.join(scp_path, f"DIM_{get_timestamp('hours_min')}")
@@ -460,6 +435,19 @@ def main():
         LOG.info(f"File {csv_filename} sent to {scp_server}:{scp_path_time}")
     else:
         LOG.warning(f"No SPM data to save from storage array {array_serial}")
+        
+        # Create empty DataFrame with expected columns
+        empty_df = pd.DataFrame(columns=[
+            'ArraySerial', 'ArrayPort', 'HostNickName', 'HostWWPN', 
+            'HostGroup', 'HostOS', 'MonitorIOps', 'MonitorKBps', 
+            'SPMLimitKBps', 'SPMLimitUtilPct', 'SPMTransfer', 'SPMPriority',
+            'SourceLoadTimeEpoch', 'SourceName', 'BatchCreateTimeEpoch'
+        ])
+        
+        csv_filename = f"nds_iolimit_export_{args.region}_{array_serial}_{get_timestamp('hours_min')}_empty.csv"
+        csv_filepath = os.path.join('.', csv_filename)
+        empty_df.to_csv(csv_filepath, index=False)
+        LOG.info(f"Empty report saved to: {csv_filepath}")
     
     # Logout from instance
     LOG.info("Logout from inst")
